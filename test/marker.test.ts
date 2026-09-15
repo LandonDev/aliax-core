@@ -65,3 +65,14 @@ describe('marker', () => {
     expect(seen.length).toBeGreaterThanOrEqual(2)
   })
 })
+
+describe('marker: two copies of one app', () => {
+  it('a second aliax hands the marker back to the first on release', () => {
+    writeFileSync(marker.MARKER_PATH, JSON.stringify({ port: 5000, pid: process.ppid, url: 'http://127.0.0.1:5000', owner: 'aliax' }))
+    const m = marker.claim('aliax', 7000)
+    expect(m.previous).toMatchObject({ owner: 'aliax', port: 5000, pid: process.ppid })
+    marker.release('aliax')
+    expect(marker.readMarker()).toMatchObject({ owner: 'aliax', port: 5000, pid: process.ppid })
+    rmSync(marker.MARKER_PATH, { force: true })
+  })
+})

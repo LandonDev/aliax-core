@@ -44,15 +44,17 @@ export function pidAlive(pid: number): boolean {
 export const isLive = (m: Marker | null): m is Marker => m !== null && pidAlive(m.pid)
 
 /**
- * Write ourselves as the gateway. When a live foreign gateway holds the marker
- * we remember it as `previous`, so releasing hands the shim back to it.
+ * Write ourselves as the gateway. When another live process holds the marker
+ * (a foreign app, or a second copy of this one, such as a dev run beside the
+ * installed app) we remember it as `previous`, so releasing hands the shim
+ * back to it.
  */
 export function claim(owner: Owner, port: number): Marker {
   const current = readMarker()
   const previous =
-    isLive(current) && current.owner !== owner && current.pid !== process.pid
+    isLive(current) && current.pid !== process.pid
       ? { port: current.port, pid: current.pid, url: current.url, owner: current.owner }
-      : current?.previous && current.owner === owner
+      : current?.pid === process.pid
         ? current.previous
         : undefined
   const marker: Marker = {
