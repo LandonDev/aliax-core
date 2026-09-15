@@ -770,7 +770,14 @@ export const claude: Adapter = {
         typeof liveExp === 'number' &&
         typeof stored.tokens.expiresAt === 'number' &&
         liveExp < stored.tokens.expiresAt
-      if (live && live !== stored.keychain && !olderThanStored) {
+      // The caller proved the live account was this profile's when the poll
+      // began, but a switch can land in between. Prove it again against the
+      // live token itself, or a poll in flight during a switch adopts the new
+      // account's token into the old profile (invariant 1).
+      const storedId = (stored.oauthAccount as { accountUuid?: unknown } | undefined)?.accountUuid
+      const liveId = live ? (await liveCliIdentity())?.accountId : undefined
+      const sameAccount = typeof storedId === 'string' && liveId === storedId
+      if (live && sameAccount && live !== stored.keychain && !olderThanStored) {
         adopted = JSON.stringify({
           keychain: live,
           oauthAccount: JSON.parse(blob).oauthAccount,
