@@ -5,7 +5,11 @@ import { join } from 'node:path'
 import { accountIdForToken, liveKeychain } from '../adapters/claude'
 import { fetch, role } from '../config'
 import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
-import { pinnedProfile } from '../settings'
+import { pinProfile, pinnedProfile } from '../settings'
+import { hooks } from '../config'
+import { observeLimit } from '../accounts'
+import { serviceIdOf } from './failover'
+import { classify429, type Limit } from './limits'
 import type { ServiceId } from '../shared/types'
 import * as vault from '../vault'
 
@@ -326,10 +330,41 @@ export function splitPath(url: string): { service: string; rest: string } {
   return { service, rest }
 }
 
+export interface LimitInfo {
+  service: string
+  serviceId: ServiceId
+  /** The request body's `model`, when it had one. */
+  model: string | null
+  limit: Limit
+  /** Accounts this request has already exhausted, the pinned one included. */
+  tried: string[]
+}
+
 export interface ForwardHooks {
   /** Every upstream answer, before its body streams back. A 429 carries its body text. */
   onResponse?: (info: { service: string; path: string; status: number; headers: Headers; body?: string }) => void
   onError?: (message: string) => void
+  /**
+   * The pinned account hit a real limit: name another account with room and
+   * the request replays under it, or return null to pass the 429 through.
+   * The gateway pins the name it gets back; the host never has to.
+   */
+  pickNext?: (info: LimitInfo) => Promise<string | null>
+  /** The first answer that got through after a switch; the host activates `to` now. */
+  onFailedOver?: (info: { service: string; serviceId: ServiceId; from: string; to: string }) => void
+}
+
+/** Replays per request: past this the 429 goes to the client as it came. */
+export const MAX_REPLAYS = 3
+
+const modelOf = (body: Buffer | undefined): string | null => {
+  if (!body || body.length === 0) return null
+  try {
+    const model = JSON.parse(body.toString('utf8'))?.model
+    return typeof model === 'string' ? model : null
+  } catch {
+    return null
+  }
 }
 
 export interface ForwardOutcome {
@@ -353,48 +388,74 @@ export async function forward(
     return { service, status: null }
   }
 
-  const credential = await credentialFor(service)
-  if (!credential) {
-    fail(
-      res,
-      503,
-      `Aliax has no usable sign-in for ${service}. Open Aliax and switch to an account, or sign in again.`
-    )
-    return { service, status: null }
-  }
-
-  const headers: Record<string, string> = {}
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (isForbiddenHeader(k.toLowerCase()) || v === undefined) continue
-    headers[k] = Array.isArray(v) ? v.join(', ') : v
-  }
-  headers['authorization'] = credential.authorization
-  // The CLI may send its own account scoping; ours must win.
-  delete headers['x-api-key']
-  for (const [k, v] of Object.entries(credential.extraHeaders ?? {})) headers[k] = v
-
   const body = ['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req)
-
+  const serviceId = serviceIdOf(service)
+  const tried: string[] = []
+  let switchedFrom: string | null = null
   let upstreamRes: Response
-  try {
-    upstreamRes = await fetch(`${upstream}${rest}`, {
-      method: req.method,
-      headers,
-      // A plain byte body, never a stream: `duplex` is rejected here, and the
-      // buffered form is what lets a retry replay the same request.
-      body: body && body.length > 0 ? new Uint8Array(body) : undefined
-    })
-  } catch (e) {
-    const message = (e as Error).message
-    on.onError?.(message)
-    fail(res, 502, `Aliax could not reach ${service}: ${message}`)
-    return { service, status: null }
-  }
+  let rejected: string | undefined
 
-  // A limit answer is small and worth keeping whole: the hook logs it for the
-  // failover fixtures, and the client still gets every byte.
-  const rejected = upstreamRes.status === 429 ? await upstreamRes.text().catch(() => '') : undefined
-  on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected })
+  // The replay loop: a real limit on the pinned account pins another (when the
+  // host names one) and sends the same bytes again. Bounded, and never for a
+  // transient 429, which the CLI retries itself.
+  for (;;) {
+    const credential = await credentialFor(service)
+    if (!credential) {
+      fail(
+        res,
+        503,
+        `Aliax has no usable sign-in for ${service}. Open Aliax and switch to an account, or sign in again.`
+      )
+      return { service, status: null }
+    }
+
+    const headers: Record<string, string> = {}
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (isForbiddenHeader(k.toLowerCase()) || v === undefined) continue
+      headers[k] = Array.isArray(v) ? v.join(', ') : v
+    }
+    headers['authorization'] = credential.authorization
+    // The CLI may send its own account scoping; ours must win.
+    delete headers['x-api-key']
+    for (const [k, v] of Object.entries(credential.extraHeaders ?? {})) headers[k] = v
+
+    try {
+      upstreamRes = await fetch(`${upstream}${rest}`, {
+        method: req.method,
+        headers,
+        // A plain byte body, never a stream: `duplex` is rejected here, and the
+        // buffered form is what lets a retry replay the same request.
+        body: body && body.length > 0 ? new Uint8Array(body) : undefined
+      })
+    } catch (e) {
+      const message = (e as Error).message
+      on.onError?.(message)
+      fail(res, 502, `Aliax could not reach ${service}: ${message}`)
+      return { service, status: null }
+    }
+
+    // A limit answer is small and worth keeping whole: the hook logs it for the
+    // failover fixtures, and the client still gets every byte.
+    rejected = upstreamRes.status === 429 ? await upstreamRes.text().catch(() => '') : undefined
+    on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected })
+
+    if (rejected === undefined || !serviceId || !on.pickNext) break
+    const pinned = pinnedProfile(serviceId)
+    const limit = classify429(service, upstreamRes.headers, rejected)
+    if (!pinned || limit.window === 'transient') break
+    observeLimit(serviceId, pinned, limit)
+    if (tried.length >= MAX_REPLAYS) break
+    tried.push(pinned)
+    const next = await on.pickNext({ service, serviceId, model: modelOf(body), limit, tried: [...tried] }).catch(() => null)
+    if (!next || next === pinned || tried.includes(next)) break
+    // Sticky by design: the pin moves only here or on a user's click, never on success.
+    pinProfile(serviceId, next)
+    switchedFrom ??= pinned
+    hooks().onAccountsChanged?.()
+  }
+  if (switchedFrom && serviceId && upstreamRes.status < 400) {
+    on.onFailedOver?.({ service, serviceId, from: switchedFrom, to: pinnedProfile(serviceId) ?? '' })
+  }
 
   const outHeaders: Record<string, string> = {}
   upstreamRes.headers.forEach((value, key) => {

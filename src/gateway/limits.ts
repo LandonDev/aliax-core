@@ -112,3 +112,103 @@ export function codexSnapshotToWindows(snapshot: unknown): UsageWindow[] {
   }
   return windows
 }
+
+/** Which bucket a 429 charged. `transient` means "the CLI retries this itself". */
+export type LimitWindow = '5h' | 'weekly' | 'credits' | 'transient' | { model: string }
+
+export interface Limit {
+  window: LimitWindow
+  /** When the bucket lifts, epoch ms. */
+  resetsAt?: number
+  /** The raw `representative-claim` (Claude) or `rate_limit_reached_type` (Codex), for the log. */
+  claim?: string
+}
+
+/**
+ * `anthropic-ratelimit-unified-representative-claim` → window. Seeded from
+ * the CLI's own window names; a claim the live capture shows that is missing
+ * here falls back to its prefix, then to the body text.
+ */
+export const CLAIM_WINDOWS: Record<string, LimitWindow> = {
+  five_hour: '5h',
+  seven_day: 'weekly',
+  seven_day_opus: { model: 'Opus' },
+  seven_day_sonnet: { model: 'Sonnet' },
+  seven_day_fable: { model: 'Fable' },
+  seven_day_cowork: { model: 'Cowork' },
+  overage: 'credits'
+}
+
+const CLAUDE_TEXT: [RegExp, (m: RegExpMatchArray) => LimitWindow][] = [
+  [/session limit/i, () => '5h'],
+  [/weekly limit/i, () => 'weekly'],
+  [/reached your (\w+) limit/i, (m) => ({ model: m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() })],
+  [/usage credits|spend limit|out of credits|shared budget|extra usage/i, () => 'credits']
+]
+
+function classifyClaude(headers: HeaderLike, body: string): Limit {
+  const unified = parseUnifiedHeaders(headers)
+  // No unified headers: an edge or overload answer, which the CLI retries itself.
+  if (!unified) return { window: 'transient' }
+  const claim = unified.representativeClaim
+  const base: Limit = { resetsAt: unified.resetsAt, claim, window: 'transient' }
+  if (unified.status === 'rejected' && claim) {
+    const known = CLAIM_WINDOWS[claim]
+    if (known) return { ...base, window: known }
+    if (claim.startsWith('seven_day')) return { ...base, window: 'weekly' }
+    if (claim.startsWith('five_hour')) return { ...base, window: '5h' }
+  }
+  for (const [re, window] of CLAUDE_TEXT) {
+    const m = body.match(re)
+    if (m) return { ...base, window: window(m) }
+  }
+  // Rejected for a reason we cannot name: still a real limit, charge the 5h window.
+  if (unified.status === 'rejected') return { ...base, window: '5h' }
+  return base
+}
+
+interface CodexError {
+  type?: string
+  code?: string
+  message?: string
+  rate_limit_reached_type?: string
+  resets_at?: number
+  resets_in_seconds?: number
+}
+
+function classifyCodex(body: string): Limit {
+  let error: CodexError = {}
+  try {
+    const parsed = JSON.parse(body)
+    error = (parsed?.error ?? parsed ?? {}) as CodexError
+  } catch {
+    error = { message: body }
+  }
+  const kind = error.type ?? error.code ?? ''
+  const code = error.code ?? error.type ?? ''
+  const message = error.message ?? ''
+  const resetsAt =
+    typeof error.resets_at === 'number'
+      ? error.resets_at < 1e12
+        ? error.resets_at * 1000
+        : error.resets_at
+      : typeof error.resets_in_seconds === 'number'
+        ? Date.now() + error.resets_in_seconds * 1000
+        : undefined
+  if (kind === 'usage_limit_reached' || code === 'usage_limit_reached') {
+    const which = error.rate_limit_reached_type
+    const window: LimitWindow = which === 'secondary' || (!which && /week/i.test(message)) ? 'weekly' : '5h'
+    return { window, resetsAt, claim: which }
+  }
+  if (/quota_exceeded|usage_not_included|insufficient_quota|credits/i.test(`${kind} ${code} ${message}`)) {
+    return { window: 'credits', resetsAt }
+  }
+  return { window: 'transient', resetsAt }
+}
+
+/** What a 429 from the provider means for the account that sent the request. */
+export function classify429(service: string, headers: HeaderLike, body: string): Limit {
+  if (service === 'claude') return classifyClaude(headers, body)
+  if (service === 'codex') return classifyCodex(body)
+  return { window: 'transient' }
+}

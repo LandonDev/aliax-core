@@ -7,6 +7,8 @@ import type { Adapter, Captured } from './adapters/types'
 import { pinProfile } from './settings'
 import { dataDir, fetch, hooks, role } from './config'
 import { isLive, readMarker } from './gateway/marker'
+import { limitLabel } from './gateway/failover'
+import type { Limit } from './gateway/limits'
 import { writeAtomic } from './fs'
 import { enabledTargets } from './settings'
 import * as vault from './vault'
@@ -484,143 +486,166 @@ export async function usage(serviceId: ServiceId, force = false): Promise<UsageR
     if (forwarded) return forwarded
   }
   const a = adapter(serviceId)
-  const profiles = vault.profiles(serviceId)
   const active = await activeProfileName(a)
-  const ttl = USAGE_TTL[serviceId] ?? DEFAULT_TTL
-  const now = Date.now()
   // One account at a time. Every profile in a service hits the same host, and
   // firing them together earns a 429 that leaves later accounts with no usage
   // and no plan — which is exactly how three of four Claude rows came up blank.
   const reports: UsageReport[] = []
-  for (const p of profiles) {
-    reports.push(
-      await (async () => {
-      const key = `${serviceId}:${p.name}`
-      const cached = cache().get(key)
+  for (const p of vault.profiles(serviceId)) reports.push(await pollProfile(a, p, active, force))
+  return reports
+}
 
-      // While the provider is still refusing us, keep serving the last good
-      // state with its countdown — never re-knock, even on a manual refresh.
-      const until = cached?.report.rateLimit?.until
-      if (until !== undefined && until > now) return cached!.report
+/**
+ * One profile's report under the same gates as `usage()`: the failover picks
+ * a candidate only after a forced poll of that one account, and the reset
+ * timers re-poll one profile when its window lifts.
+ */
+export async function usageOf(serviceId: ServiceId, name: string, force = false): Promise<UsageReport | null> {
+  if (force && role() === 'standby') {
+    const forwarded = await forwardedUsage(serviceId)
+    if (forwarded) return forwarded.find((r) => r.profileName === name) ?? null
+  }
+  const p = vault.profiles(serviceId).find((x) => x.name === name)
+  if (!p) return null
+  const a = adapter(serviceId)
+  return pollProfile(a, p, await activeProfileName(a), force)
+}
 
-      // A countdown that has run out must poll now. Falling through to the
-      // freshness check below kept serving the limited report for the rest of
-      // the TTL, which is why the line sat on "retrying…" and never retried.
-      const limitFinished = until !== undefined && until <= now
+/** Mark one cached report stale so the next poll goes to the network, keeping its numbers. */
+export function markUsageStale(serviceId: ServiceId, name: string): void {
+  const key = `${serviceId}:${name}`
+  const entry = cache().get(key)
+  if (!entry || entry.stale) return
+  cache().set(key, { ...entry, stale: true })
+  persistCache()
+}
 
-      // Otherwise honour the freshness cache, unless the user forced a poll.
-      if (!force && !limitFinished && cached && !cached.stale && now - cached.at < ttl) {
-        return cached.report
-      }
+async function pollProfile(a: Adapter, p: { name: string }, active: string | null, force: boolean): Promise<UsageReport> {
+  const serviceId = a.id
+  const ttl = USAGE_TTL[serviceId] ?? DEFAULT_TTL
+  const now = Date.now()
+  const key = `${serviceId}:${p.name}`
+  const cached = cache().get(key)
 
-      // A secret that fails to decrypt (safeStorage keys rotate if the app name
-      // ever changes) must not kill the whole poll. The active profile can heal
-      // itself — its live credentials are on disk in plaintext, so recapture and
-      // re-encrypt them. Anyone else keeps their row with an honest note; the
-      // stored blob is never deleted (invariant 4).
-      let blob: string | null = null
+  // While the provider is still refusing us, keep serving the last good
+  // state with its countdown — never re-knock, even on a manual refresh.
+  const until = cached?.report.rateLimit?.until
+  if (until !== undefined && until > now) return cached!.report
+
+  // A countdown that has run out must poll now. Falling through to the
+  // freshness check below kept serving the limited report for the rest of
+  // the TTL, which is why the line sat on "retrying…" and never retried.
+  const limitFinished = until !== undefined && until <= now
+
+  // Otherwise honour the freshness cache, unless the user forced a poll.
+  if (!force && !limitFinished && cached && !cached.stale && now - cached.at < ttl) {
+    return cached.report
+  }
+
+  // A secret that fails to decrypt (safeStorage keys rotate if the app name
+  // ever changes) must not kill the whole poll. The active profile can heal
+  // itself — its live credentials are on disk in plaintext, so recapture and
+  // re-encrypt them. Anyone else keeps their row with an honest note; the
+  // stored blob is never deleted (invariant 4).
+  let blob: string | null = null
+  try {
+    blob = vault.readSecret(serviceId, p.name)
+  } catch {
+    if (p.name === active) {
+      await recaptureLive(a).catch(() => {})
       try {
         blob = vault.readSecret(serviceId, p.name)
       } catch {
-        if (p.name === active) {
-          await recaptureLive(a).catch(() => {})
-          try {
-            blob = vault.readSecret(serviceId, p.name)
-          } catch {
-            blob = null
-          }
-        }
-        if (!blob) {
-          return {
-            profileName: p.name,
-            windows: [],
-            note: 'saved sign-in unreadable. Switch to it once, or add it again',
-            plan: cached?.report.plan
-          }
-        }
+        blob = null
       }
-      if (!blob) return { profileName: p.name, windows: [], note: 'app session only. Add account for usage' }
-      try {
-        const result = await a.usage(blob, p.name === active, force, role() === 'owner')
-        if (result.updatedBlob) vault.saveSecret(serviceId, p.name, result.updatedBlob)
-
-        // The sign-in is dead: keep the last good windows, flag it so the row
-        // offers a same-email re-login, and clear any stale rate-limit line.
-        if (result.expired) {
-          const base = cached?.report.windows.length
-            ? cached.report
-            : { profileName: p.name, windows: [] as UsageWindow[] }
-          const merged: UsageReport = {
-            ...base,
-            profileName: p.name,
-            note: undefined,
-            plan: result.plan ?? base.plan,
-            rateLimit: undefined,
-            expired: true
-          }
-          cache().set(key, { at: now, report: merged })
-          persistCache()
-          return merged
-        }
-
-        // Rate limited: keep the last good windows, flag the limit on top. The
-        // countdown comes from Retry-After when the provider sends one; without
-        // it, back off half a TTL so the auto-poll stops knocking.
-        if (result.note === 'usage temporarily unavailable') {
-          const base = cached?.report.windows.length
-            ? cached.report
-            : { profileName: p.name, windows: [] as UsageWindow[] }
-          const limitUntil = result.retryAfterMs !== undefined ? now + result.retryAfterMs : undefined
-          const merged: UsageReport = {
-            ...base,
-            profileName: p.name,
-            note: undefined,
-            plan: result.plan ?? base.plan,
-            rateLimit: { provider: a.name, until: limitUntil }
-          }
-          cache().set(key, { at: limitUntil !== undefined ? now : now - ttl / 2, report: merged })
-          persistCache()
-          return merged
-        }
-
-        const report: UsageReport = {
-          profileName: p.name,
-          windows: result.windows,
-          note: result.note,
-          extra: result.extra,
-          banked: result.banked,
-          // A plan changes about once a year; a failed poll shouldn't make the
-          // price line vanish and reappear.
-          plan: result.plan ?? cached?.report.plan
-        }
-        // A non-rate-limit hiccup (session expired mid-poll, etc.): keep the last
-        // good numbers rather than blanking the row, and clear any stale limit.
-        if (report.windows.length === 0 && report.note && cached?.report.windows.length) {
-          const kept: UsageReport = { ...cached.report, rateLimit: undefined }
-          cache().set(key, { at: now, report: kept })
-          persistCache()
-          return kept
-        }
-        for (const w of report.windows) {
-          hooks().onUsageSample?.({ service: serviceId, account: p.name, label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt, periodMs: w.periodMs })
-        }
-        cache().set(key, { at: now, report })
-        persistCache()
-        return report
-      } catch (e) {
-        // Keep the last good numbers, but never re-serve a countdown that has
-        // already run out: it would read as "retrying…" for good.
-        if (cached) return limitFinished ? { ...cached.report, rateLimit: undefined } : cached.report
-        return {
-          profileName: p.name,
-          windows: [],
-          note: `usage unavailable (${(e as Error).message})`
-        }
+    }
+    if (!blob) {
+      return {
+        profileName: p.name,
+        windows: [],
+        note: 'saved sign-in unreadable. Switch to it once, or add it again',
+        plan: cached?.report.plan
       }
-      })()
-    )
+    }
   }
-  return reports
+  if (!blob) return { profileName: p.name, windows: [], note: 'app session only. Add account for usage' }
+  try {
+    const result = await a.usage(blob, p.name === active, force, role() === 'owner')
+    if (result.updatedBlob) vault.saveSecret(serviceId, p.name, result.updatedBlob)
+
+    // The sign-in is dead: keep the last good windows, flag it so the row
+    // offers a same-email re-login, and clear any stale rate-limit line.
+    if (result.expired) {
+      const base = cached?.report.windows.length
+        ? cached.report
+        : { profileName: p.name, windows: [] as UsageWindow[] }
+      const merged: UsageReport = {
+        ...base,
+        profileName: p.name,
+        note: undefined,
+        plan: result.plan ?? base.plan,
+        rateLimit: undefined,
+        expired: true
+      }
+      cache().set(key, { at: now, report: merged })
+      persistCache()
+      return merged
+    }
+
+    // Rate limited: keep the last good windows, flag the limit on top. The
+    // countdown comes from Retry-After when the provider sends one; without
+    // it, back off half a TTL so the auto-poll stops knocking.
+    if (result.note === 'usage temporarily unavailable') {
+      const base = cached?.report.windows.length
+        ? cached.report
+        : { profileName: p.name, windows: [] as UsageWindow[] }
+      const limitUntil = result.retryAfterMs !== undefined ? now + result.retryAfterMs : undefined
+      const merged: UsageReport = {
+        ...base,
+        profileName: p.name,
+        note: undefined,
+        plan: result.plan ?? base.plan,
+        rateLimit: { provider: a.name, until: limitUntil }
+      }
+      cache().set(key, { at: limitUntil !== undefined ? now : now - ttl / 2, report: merged })
+      persistCache()
+      return merged
+    }
+
+    const report: UsageReport = {
+      profileName: p.name,
+      windows: result.windows,
+      note: result.note,
+      extra: result.extra,
+      banked: result.banked,
+      // A plan changes about once a year; a failed poll shouldn't make the
+      // price line vanish and reappear.
+      plan: result.plan ?? cached?.report.plan
+    }
+    // A non-rate-limit hiccup (session expired mid-poll, etc.): keep the last
+    // good numbers rather than blanking the row, and clear any stale limit.
+    if (report.windows.length === 0 && report.note && cached?.report.windows.length) {
+      const kept: UsageReport = { ...cached.report, rateLimit: undefined }
+      cache().set(key, { at: now, report: kept })
+      persistCache()
+      return kept
+    }
+    for (const w of report.windows) {
+      hooks().onUsageSample?.({ service: serviceId, account: p.name, label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt, periodMs: w.periodMs })
+    }
+    cache().set(key, { at: now, report })
+    persistCache()
+    return report
+  } catch (e) {
+    // Keep the last good numbers, but never re-serve a countdown that has
+    // already run out: it would read as "retrying…" for good.
+    if (cached) return limitFinished ? { ...cached.report, rateLimit: undefined } : cached.report
+    return {
+      profileName: p.name,
+      windows: [],
+      note: `usage unavailable (${(e as Error).message})`
+    }
+  }
 }
 
 /**
@@ -661,6 +686,30 @@ function persistObserved(): void {
   observedPersistTimer = null
   observedPersistAt = Date.now()
   persistCache()
+}
+
+/**
+ * A 429 just charged one of this account's windows: show it full with the
+ * provider's reset, persisted at once so the standby app and the failover see
+ * it before any poll would. The rest of the report is left alone.
+ */
+export function observeLimit(serviceId: ServiceId, name: string, limit: Limit): UsageReport | null {
+  const label = limitLabel(serviceId, limit.window)
+  if (!label) return null
+  const key = `${serviceId}:${name}`
+  const cached = cache().get(key)
+  const base: UsageReport = cached?.report ?? { profileName: name, windows: [] }
+  const i = base.windows.findIndex((w) => w.label === label)
+  const window: UsageWindow = { ...(i >= 0 ? base.windows[i] : { label }), usedPercent: 100 }
+  if (limit.resetsAt !== undefined) window.resetsAt = limit.resetsAt
+  const windows = [...base.windows]
+  if (i >= 0) windows[i] = window
+  else windows.push(window)
+  const report: UsageReport = { ...base, windows }
+  cache().set(key, { ...cached, at: Date.now(), report })
+  persistCache()
+  hooks().onUsageSample?.({ service: serviceId, account: name, label, usedPercent: 100, resetsAt: window.resetsAt, periodMs: window.periodMs })
+  return report
 }
 
 /** Test seams: the adapter table and the never-backwards save. */
