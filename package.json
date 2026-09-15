@@ -1,0 +1,22 @@
+{
+  "name": "aliax-core",
+  "version": "0.1.0",
+  "description": "Aliax's account vault, provider adapters, usage polling and gateway forwarding, shared by Aliax and temp-code",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "files": ["src", "LICENSE", "README.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
