@@ -5,7 +5,8 @@ import type { ActionResult, ServiceId, ServiceView, UsageReport, UsageWindow } f
 import { adapter, adapters } from './adapters'
 import type { Adapter, Captured } from './adapters/types'
 import { pinProfile } from './settings'
-import { dataDir, hooks, role } from './config'
+import { dataDir, fetch, hooks, role } from './config'
+import { isLive, readMarker } from './gateway/marker'
 import { writeAtomic } from './fs'
 import { enabledTargets } from './settings'
 import * as vault from './vault'
@@ -452,7 +453,36 @@ export function clearUsageCache(serviceId: ServiceId, freshlySigned?: string): v
  * button does. It never bypasses an active rate-limit window: a manual refresh
  * that hammered a 429 is exactly what once pinned an account for an hour.
  */
+/** The mtime of the usage cache as last read or written here; other writers differ. */
+export const cacheMtimeSeen = (): number => loadedMtime
+
+/**
+ * A standby must not poll: one poller per machine keeps the 429 budget whole
+ * and the stored tokens in one refresher's hands. Its forced refresh goes to
+ * the gateway owner's control endpoint, which polls and writes the shared
+ * cache; the reply is the owner's fresh reports. Null when no owner answers.
+ */
+async function forwardedUsage(serviceId: ServiceId): Promise<UsageReport[] | null> {
+  const owner = readMarker()
+  if (!isLive(owner) || owner.pid === process.pid) return null
+  try {
+    const res = await fetch(`${owner.url}/__aliax/usage?service=${serviceId}&force=1`, {
+      signal: AbortSignal.timeout(60_000)
+    })
+    if (!res.ok) return null
+    const { reports } = (await res.json()) as { reports: UsageReport[] }
+    cache()
+    return reports
+  } catch {
+    return null
+  }
+}
+
 export async function usage(serviceId: ServiceId, force = false): Promise<UsageReport[]> {
+  if (force && role() === 'standby') {
+    const forwarded = await forwardedUsage(serviceId)
+    if (forwarded) return forwarded
+  }
   const a = adapter(serviceId)
   const profiles = vault.profiles(serviceId)
   const active = await activeProfileName(a)
