@@ -28,7 +28,7 @@ function identity(authJson: string): { accountId: string; email?: string } {
   return { accountId, email }
 }
 
-function windowLabel(minutes: number | undefined): string {
+export function windowLabel(minutes: number | undefined): string {
   if (minutes === undefined) return 'usage'
   if (minutes === 10080) return 'week'
   if (minutes <= 600) return `${Math.round(minutes / 60)}h`

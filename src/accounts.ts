@@ -623,6 +623,46 @@ export async function usage(serviceId: ServiceId, force = false): Promise<UsageR
   return reports
 }
 
+/**
+ * Windows the gateway read off live traffic (Claude's unified headers, the
+ * Codex app-server's snapshot) for the account in use. They replace the same
+ * labels in the cached report and leave the rest — model-scoped weeklies
+ * still come only from the usage poll. Persisting is throttled: a busy turn
+ * answers many times a second.
+ */
+const OBSERVE_PERSIST_MS = 5_000
+let observedPersistAt = 0
+let observedPersistTimer: NodeJS.Timeout | null = null
+
+export function observeWindows(serviceId: ServiceId, name: string, windows: UsageWindow[]): UsageReport | null {
+  if (windows.length === 0) return null
+  const key = `${serviceId}:${name}`
+  const cached = cache().get(key)
+  const base: UsageReport = cached?.report ?? { profileName: name, windows: [] }
+  const merged = [...base.windows]
+  for (const w of windows) {
+    const i = merged.findIndex((m) => m.label === w.label)
+    if (i >= 0) merged[i] = { ...merged[i], ...w }
+    else merged.push(w)
+  }
+  const report: UsageReport = { ...base, windows: merged }
+  cache().set(key, { ...cached, at: Date.now(), report })
+  for (const w of windows) {
+    hooks().onUsageSample?.({ service: serviceId, account: name, label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt, periodMs: w.periodMs })
+  }
+  const due = observedPersistAt + OBSERVE_PERSIST_MS - Date.now()
+  if (due <= 0) persistObserved()
+  else if (!observedPersistTimer) observedPersistTimer = setTimeout(persistObserved, due)
+  return report
+}
+
+function persistObserved(): void {
+  if (observedPersistTimer) clearTimeout(observedPersistTimer)
+  observedPersistTimer = null
+  observedPersistAt = Date.now()
+  persistCache()
+}
+
 /** Test seams: the adapter table and the never-backwards save. */
 export const adapterForTest = adapter
 export { saveSecretUnlessOlder }

@@ -77,4 +77,26 @@ describe('forward', () => {
       configure({ dataDir: '/tmp', fetch: globalThis.fetch, secrets: { mode: 'chromiumKey', keychainItem: 'x' } })
     }
   })
+  it('hands a 429 body to the hook and still delivers it to the client', async () => {
+    const fetch = vi.fn(async () =>
+      new Response('{"type":"error","error":{"type":"rate_limit_error"}}', {
+        status: 429,
+        headers: { 'anthropic-ratelimit-unified-status': 'rejected' }
+      })
+    )
+    ;({ cleanup } = tempCore({ fetch }))
+    vault.upsertProfile('codex', { name: 'p', accountId: 'acct-1', createdAt: 1 })
+    vault.saveSecret('codex', 'p', codexAuth('PINNED'))
+    pinProfile('codex', 'p')
+    const seen: { status: number; body?: string }[] = []
+    server = createServer((req, res) => {
+      void forward(req, res, { onResponse: (info) => seen.push({ status: info.status, body: info.body }) })
+    })
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+    const port = (server.address() as { port: number }).port
+    const res = await globalThis.fetch(`http://127.0.0.1:${port}/codex/v1/responses`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(429)
+    expect(await res.text()).toContain('rate_limit_error')
+    expect(seen).toEqual([{ status: 429, body: '{"type":"error","error":{"type":"rate_limit_error"}}' }])
+  })
 })

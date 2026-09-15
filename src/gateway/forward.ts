@@ -327,8 +327,8 @@ export function splitPath(url: string): { service: string; rest: string } {
 }
 
 export interface ForwardHooks {
-  /** Every upstream answer, before its body streams back. */
-  onResponse?: (info: { service: string; path: string; status: number; headers: Headers }) => void
+  /** Every upstream answer, before its body streams back. A 429 carries its body text. */
+  onResponse?: (info: { service: string; path: string; status: number; headers: Headers; body?: string }) => void
   onError?: (message: string) => void
 }
 
@@ -391,7 +391,10 @@ export async function forward(
     return { service, status: null }
   }
 
-  on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers })
+  // A limit answer is small and worth keeping whole: the hook logs it for the
+  // failover fixtures, and the client still gets every byte.
+  const rejected = upstreamRes.status === 429 ? await upstreamRes.text().catch(() => '') : undefined
+  on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected })
 
   const outHeaders: Record<string, string> = {}
   upstreamRes.headers.forEach((value, key) => {
@@ -404,6 +407,10 @@ export async function forward(
   })
   res.writeHead(upstreamRes.status, outHeaders)
 
+  if (rejected !== undefined) {
+    res.end(rejected)
+    return { service, status: upstreamRes.status }
+  }
   if (!upstreamRes.body) {
     res.end()
     return { service, status: upstreamRes.status }
