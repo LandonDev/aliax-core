@@ -30,7 +30,7 @@ export interface UsageSample {
 export interface Hooks {
   onUsageSample?: (sample: UsageSample) => void
   onAppEvent?: (kind: string, service?: ServiceId, account?: string, detail?: string) => void
-  /** Profiles, pins or usage changed on disk or in memory; hosts redraw. */
+  /** The pinned account changed (a switch, later a failover); hosts redraw. Not fired for cache writes: a host that answers it with a poll would loop. */
   onAccountsChanged?: () => void
 }
 

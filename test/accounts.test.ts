@@ -50,6 +50,16 @@ describe('accounts.usage cache gates', () => {
     expect(usage).toHaveBeenCalledTimes(1)
   })
 
+  it('a poll writes the cache without firing onAccountsChanged', async () => {
+    const onAccountsChanged = vi.fn()
+    ;({ cleanup } = tempCore({ hooks: { onAccountsChanged } }))
+    vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })
+    vault.saveSecret('codex', 'p', '{}')
+    stubCodex(async () => ({ windows: [] }))
+    await accounts.usage('codex', true)
+    expect(onAccountsChanged).not.toHaveBeenCalled()
+  })
+
   it('passes mayRefresh=false when the app is standby', async () => {
     ;({ cleanup } = tempCore({ role: () => 'standby' }))
     vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })

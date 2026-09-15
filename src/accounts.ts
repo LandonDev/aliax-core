@@ -352,6 +352,7 @@ export async function activate(serviceId: ServiceId, name: string): Promise<Acti
   hooks().onAppEvent?.('switch', serviceId, name, notes.join(' · '))
   vault.upsertProfile(serviceId, { ...profile, lastActivatedAt: Date.now() })
   clearUsageCache(serviceId)
+  hooks().onAccountsChanged?.()
   return { ok: true, notes }
 }
 
@@ -409,7 +410,6 @@ function cache(): Map<string, CacheEntry> {
 function persistCache(): void {
   writeAtomic(usageCachePath(), JSON.stringify(Object.fromEntries(cache())))
   loadedMtime = fileMtime()
-  hooks().onAccountsChanged?.()
 }
 
 
