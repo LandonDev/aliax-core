@@ -53,6 +53,8 @@ export interface ProxyStatus {
   routed: Record<string, number>
   /** Profile name each service is authenticating as right now. */
   accounts: Partial<Record<ServiceId, string | null>>
+  /** Set while another app owns the shim marker; we serve but do not claim. */
+  standby?: 'aliax' | 'temp-code' | null
   error: string | null
 }
 
