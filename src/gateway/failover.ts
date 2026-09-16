@@ -36,6 +36,9 @@ export function requiredTiers(serviceId: ServiceId, model: string | null | undef
   return out
 }
 
+/** The service's overall weekly window: the clock every failover pick is ordered by. */
+export const weeklyLabel = (serviceId: ServiceId): string => (serviceId === 'codex' ? 'week' : 'Weekly')
+
 /** The report label a classified limit lands on. */
 export function limitLabel(serviceId: ServiceId, window: LimitWindow): string | null {
   if (window === 'transient') return null
@@ -61,9 +64,10 @@ export function hasRoom(report: UsageReport | undefined, tiers: string[], now: n
 }
 
 /**
- * Soonest-to-reset first in the window that just closed; accounts with no
- * reset on file go last, and ones whose usage endpoint is itself limited
- * after those.
+ * Soonest-to-reset first in the given window — always the weekly one, whatever
+ * window just closed, since the week is the budget that actually runs out;
+ * accounts with no reset on file go last, and ones whose usage endpoint is
+ * itself limited after those.
  */
 export function orderByReset(label: string | null, reports: UsageReport[], now: number) {
   const key = (name: string): number => {
@@ -76,22 +80,21 @@ export function orderByReset(label: string | null, reports: UsageReport[], now: 
 }
 
 export interface CandidateInput {
+  serviceId: ServiceId
   profiles: Pick<ProfileView, 'name'>[]
   reports: UsageReport[]
   required: string[]
   tried: string[]
-  /** Which window closed, for the ordering. */
-  label: string | null
   now: number
 }
 
-/** Untried, unexpired accounts with room in every required tier, best first. */
-export function candidates({ profiles, reports, required, tried, label, now }: CandidateInput): string[] {
+/** Untried, unexpired accounts with room in every required tier, soonest weekly reset first. */
+export function candidates({ serviceId, profiles, reports, required, tried, now }: CandidateInput): string[] {
   return profiles
     .map((p) => p.name)
     .filter((name) => !tried.includes(name))
     .filter((name) => hasRoom(reports.find((r) => r.profileName === name), required, now))
-    .sort(orderByReset(label, reports, now))
+    .sort(orderByReset(weeklyLabel(serviceId), reports, now))
 }
 
 export interface PickInput {
@@ -115,8 +118,7 @@ export interface PickInput {
 export async function pickNext(input: PickInput): Promise<string | null> {
   const now = input.now ?? Date.now()
   const required = requiredTiers(input.serviceId, input.model, input.liveModels)
-  const label = limitLabel(input.serviceId, input.window)
-  for (const name of candidates({ ...input, required, label, now })) {
+  for (const name of candidates({ ...input, required, now })) {
     const fresh = await input.poll(name).catch(() => null)
     if (!fresh || hasRoom(fresh, required, now)) return name
   }

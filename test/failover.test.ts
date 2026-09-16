@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { candidates, hasRoom, limitLabel, orderByReset, pickNext, requiredTiers, tiersFor } from '../src/gateway/failover'
+import { candidates, hasRoom, limitLabel, orderByReset, pickNext, requiredTiers, tiersFor, weeklyLabel } from '../src/gateway/failover'
 import { classify429 } from '../src/gateway/limits'
 import type { UsageReport } from '../src/shared/types'
 
@@ -38,26 +38,35 @@ describe('room and ordering', () => {
     expect(hasRoom(report('a', [{ label: '5h', usedPercent: 1 }], { expired: true }), ['5h'], NOW)).toBe(false)
     expect(hasRoom(report('a', [{ label: 'Credits', usedPercent: 100 }]), ['5h'], NOW)).toBe(false)
   })
-  it('orders by the closed window\'s reset, unknown last, usage-limited after that; no floor on how full', () => {
+  it('orders by the weekly reset, unknown last, usage-limited after that; no floor on how full', () => {
     const reports = [
-      report('late', [{ label: '5h', usedPercent: 90, resetsAt: NOW + 3_000 }]),
-      report('soon', [{ label: '5h', usedPercent: 99, resetsAt: NOW + 1_000 }]),
-      report('unknown', [{ label: '5h', usedPercent: 10 }]),
-      report('limited', [{ label: '5h', usedPercent: 0, resetsAt: NOW + 500 }], { rateLimit: { provider: 'x', until: NOW + 60_000 } })
+      report('late', [{ label: 'Weekly', usedPercent: 90, resetsAt: NOW + 3_000 }]),
+      report('soon', [{ label: 'Weekly', usedPercent: 99, resetsAt: NOW + 1_000 }]),
+      report('unknown', [{ label: 'Weekly', usedPercent: 10 }]),
+      report('limited', [{ label: 'Weekly', usedPercent: 0, resetsAt: NOW + 500 }], { rateLimit: { provider: 'x', until: NOW + 60_000 } })
     ]
-    const names = reports.map((r) => r.profileName).sort(orderByReset('5h', reports, NOW))
+    const names = reports.map((r) => r.profileName).sort(orderByReset(weeklyLabel('claude-code'), reports, NOW))
     expect(names).toEqual(['soon', 'late', 'unknown', 'limited'])
+    expect(weeklyLabel('codex')).toBe('week')
+  })
+  it('a 5h limit still orders by the weekly reset, never the 5h one', () => {
+    const reports = [
+      report('week-late', [{ label: '5h', usedPercent: 50, resetsAt: NOW + 1 }, { label: 'Weekly', usedPercent: 50, resetsAt: NOW + 9_000 }]),
+      report('week-soon', [{ label: '5h', usedPercent: 50, resetsAt: NOW + 9_000 }, { label: 'Weekly', usedPercent: 50, resetsAt: NOW + 1 }])
+    ]
+    const profiles = ['week-late', 'week-soon'].map((name) => ({ name }))
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: [], now: NOW })).toEqual(['week-soon', 'week-late'])
   })
   it('candidates drop tried, expired and full accounts', () => {
     const reports = [
       report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 9 }]),
-      report('b', [{ label: '5h', usedPercent: 50, resetsAt: NOW + 5 }]),
+      report('b', [{ label: '5h', usedPercent: 50 }, { label: 'Weekly', usedPercent: 50, resetsAt: NOW + 5 }]),
       report('c', [{ label: '5h', usedPercent: 10 }], { expired: true }),
-      report('d', [{ label: '5h', usedPercent: 20, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 99 }])
+      report('d', [{ label: '5h', usedPercent: 20 }, { label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 99 }])
     ]
     const profiles = ['a', 'b', 'c', 'd', 'e'].map((name) => ({ name }))
-    expect(candidates({ profiles, reports, required: ['5h', 'Weekly'], tried: ['a'], label: '5h', now: NOW })).toEqual(['d', 'b', 'e'])
-    expect(candidates({ profiles, reports, required: ['5h', 'Weekly', 'Fable'], tried: ['a'], label: '5h', now: NOW })).toEqual(['b', 'e'])
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: ['a'], now: NOW })).toEqual(['d', 'b', 'e'])
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly', 'Fable'], tried: ['a'], now: NOW })).toEqual(['b', 'e'])
   })
 })
 
