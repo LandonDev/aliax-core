@@ -65,7 +65,7 @@ describe('forward failover', () => {
     expect(calls.map((c) => c.auth)).toEqual(['Bearer A', 'Bearer B'])
     expect(calls[1].body).toBe('{"model":"gpt-6-astra","input":"hi"}')
     expect(picks).toEqual([
-      { service: 'codex', serviceId: 'codex', model: 'gpt-6-astra', limit: { window: '5h', resetsAt: 1_800_000_000_000, claim: 'primary' }, tried: ['A'] }
+      { service: 'codex', serviceId: 'codex', model: 'gpt-6-astra', limit: { window: '5h', resetsAt: 1_800_000_000_000, claim: 'primary' }, tried: ['A'], account: 'A', thread: undefined }
     ])
     expect(pinnedProfile('codex')).toBe('B')
     expect(switched).toEqual([{ service: 'codex', serviceId: 'codex', from: 'A', to: 'B' }])

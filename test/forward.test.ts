@@ -23,7 +23,7 @@ describe('forward', () => {
     expect(upstreamFor('codex', '/v1/responses')).toBe('https://chatgpt.com/backend-api/codex')
     expect(upstreamFor('codex', '/plugins')).toBe('https://chatgpt.com/backend-api')
     expect(upstreamFor('nope', '/')).toBeNull()
-    expect(splitPath('/codex/api/codex/ps/mcp')).toEqual({ service: 'codex', rest: '/ps/mcp' })
+    expect(splitPath('/codex/api/codex/ps/mcp')).toEqual({ service: 'codex', rest: '/ps/mcp', scope: null })
   })
 
   it('swaps Authorization for the pinned account and streams the answer', async () => {

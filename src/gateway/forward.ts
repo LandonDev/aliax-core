@@ -7,8 +7,8 @@ import { fetch, role } from '../config'
 import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
 import { pinProfile, pinnedProfile } from '../settings'
 import { hooks } from '../config'
-import { observeLimit } from '../accounts'
-import { serviceIdOf } from './failover'
+import { cachedReport, observeLimit } from '../accounts'
+import { blockedWindow, serviceIdOf, tiersFor } from './failover'
 import { classify429, type Limit } from './limits'
 import type { ServiceId } from '../shared/types'
 import * as vault from '../vault'
@@ -82,17 +82,19 @@ export interface Credential {
 const EXPIRY_MARGIN_MS = 60_000
 
 /**
- * One refresh at a time per service. Rotating refresh tokens invalidate their
- * predecessor, so two concurrent refreshes would present the same token twice
- * and get the whole grant revoked (invariant 12).
+ * One refresh at a time per profile. Rotating refresh tokens invalidate their
+ * predecessor, so two concurrent refreshes of the same grant would present the
+ * same token twice and get it revoked (invariant 12). Different profiles hold
+ * different grants and may refresh side by side.
  */
-const refreshing = new Map<ServiceId, Promise<void>>()
+const refreshing = new Map<string, Promise<void>>()
 
-function once(serviceId: ServiceId, work: () => Promise<void>): Promise<void> {
-  const existing = refreshing.get(serviceId)
+function once(serviceId: ServiceId, name: string, work: () => Promise<void>): Promise<void> {
+  const key = `${serviceId}:${name}`
+  const existing = refreshing.get(key)
   if (existing) return existing
-  const p = work().finally(() => refreshing.delete(serviceId))
-  refreshing.set(serviceId, p)
+  const p = work().finally(() => refreshing.delete(key))
+  refreshing.set(key, p)
   return p
 }
 
@@ -108,7 +110,7 @@ async function refreshClaudeIfNeeded(name: string, blob: string): Promise<void> 
   const expiresAt = typeof tokens?.expiresAt === 'number' ? tokens.expiresAt : 0
   if (!tokens?.refreshToken || expiresAt - Date.now() > EXPIRY_MARGIN_MS) return
 
-  await once('claude-code', async () => {
+  await once('claude-code', name, async () => {
     const res = await fetch(CLAUDE_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -156,7 +158,7 @@ async function refreshCodexIfNeeded(name: string, raw: string): Promise<void> {
   }
   if (exp * 1000 - Date.now() > EXPIRY_MARGIN_MS) return
 
-  await once('codex', async () => {
+  await once('codex', name, async () => {
     const res = await fetch(OPENAI_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -210,7 +212,8 @@ const expiryOf = (keychain: string | null): number => {
 }
 
 /**
- * Claude's credential for the pinned account.
+ * Claude's credential for one account: the request's scoped account, else the
+ * pinned one.
  *
  * The Keychain copy wins whenever it belongs to the same account, because the
  * CLI refreshes it hourly and our stored snapshot goes stale within the hour.
@@ -219,8 +222,8 @@ const expiryOf = (keychain: string | null): number => {
  * a grant gets revoked (invariant 12). Only a pinned account that is NOT the
  * live one is ours to refresh, and only when we are the gateway owner.
  */
-async function claudeCredential(): Promise<Credential | null> {
-  const name = pinnedProfile('claude-code')
+async function claudeCredential(account: string | null): Promise<Credential | null> {
+  const name = account ?? pinnedProfile('claude-code')
   const live = await liveKeychain()
   if (!name) return live ? bearer(live) : null
 
@@ -270,9 +273,9 @@ async function claudeCredential(): Promise<Credential | null> {
   return null
 }
 
-/** Codex: the pinned profile's auth.json, falling back to the live file. */
-async function codexCredential(): Promise<Credential | null> {
-  const name = pinnedProfile('codex')
+/** Codex: the account's (else the pinned profile's) auth.json, falling back to the live file. */
+async function codexCredential(account: string | null): Promise<Credential | null> {
+  const name = account ?? pinnedProfile('codex')
   let raw = name ? vault.readSecret('codex', name) : null
   if (name && raw) {
     if (role() === 'owner') await refreshCodexIfNeeded(name, raw).catch(() => {})
@@ -296,8 +299,9 @@ async function codexCredential(): Promise<Credential | null> {
   }
 }
 
-export const credentialFor = (service: string): Promise<Credential | null> =>
-  service === 'claude' ? claudeCredential() : codexCredential()
+/** The credential to send for `service`, under `account` when a request names one. */
+export const credentialFor = (service: string, account: string | null = null): Promise<Credential | null> =>
+  service === 'claude' ? claudeCredential(account) : codexCredential(account)
 
 export function fail(res: ServerResponse, status: number, message: string): void {
   if (res.headersSent) {
@@ -318,17 +322,68 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
-/** Split `/codex/v1/responses` into its service and upstream path. */
-export function splitPath(url: string): { service: string; rest: string } {
+/**
+ * A scope segment names the thread a request belongs to and the account it
+ * should spend from, so one gateway can serve many threads on many accounts:
+ *   /claude/~t=<thread>;a=<account>[;pin=1]/v1/messages
+ * `pin=1` says the account is an explicit pin (thread, project or workspace)
+ * rather than an automatic pick; a pinned thread returns to its pin once that
+ * account has room again, an automatic one stays where failover left it.
+ */
+export interface RouteScope {
+  thread: string
+  account: string
+  pin: boolean
+}
+
+/** Parse one `~t=…;a=…` path segment; null when it is not a scope. */
+export function parseScope(segment: string): RouteScope | null {
+  if (!segment.startsWith('~')) return null
+  const fields: Record<string, string> = {}
+  for (const part of segment.slice(1).split(';')) {
+    const eq = part.indexOf('=')
+    if (eq === -1) continue
+    try {
+      fields[part.slice(0, eq)] = decodeURIComponent(part.slice(eq + 1))
+    } catch {
+      return null
+    }
+  }
+  if (!fields.t || !fields.a) return null
+  return { thread: fields.t, account: fields.a, pin: fields.pin === '1' }
+}
+
+/** Split `/codex/~t=T;a=A/v1/responses` into its service, scope and upstream path. */
+export function splitPath(url: string): { service: string; rest: string; scope: RouteScope | null } {
   const slash = url.indexOf('/', 1)
   const service = url.slice(1, slash === -1 ? undefined : slash)
   let rest = slash === -1 ? '' : url.slice(slash)
+  let scope: RouteScope | null = null
+  if (rest.startsWith('/~')) {
+    const end = rest.indexOf('/', 1)
+    scope = parseScope(rest.slice(1, end === -1 ? undefined : end))
+    if (scope) rest = end === -1 ? '' : rest.slice(end)
+  }
   // Codex builds its connector-runtime URL as <base>/api/codex/ps/mcp when
   // the base (us) has no /backend-api marker — strip the doubled prefix so
   // /ps/* resolves against the real codex backend.
   if (service === 'codex' && rest.startsWith('/api/codex/')) rest = rest.slice('/api/codex'.length)
-  return { service, rest }
+  return { service, rest, scope }
 }
+
+/**
+ * Where each scoped thread routes when failover moved it off the account its
+ * URL names. Owner memory only: an owner restart forgets the overrides, and the
+ * pre-emptive pick on the thread's next request derives them again from the
+ * usage cache.
+ */
+const routes = new Map<string, string>()
+
+/** The account a thread currently routes to, when failover moved it. */
+export const routeOf = (thread: string): string | undefined => routes.get(thread)
+
+/** Test seam: forget every per-thread override. */
+export const clearRoutes = (): void => routes.clear()
 
 export interface LimitInfo {
   service: string
@@ -336,22 +391,45 @@ export interface LimitInfo {
   /** The request body's `model`, when it had one. */
   model: string | null
   limit: Limit
-  /** Accounts this request has already exhausted, the pinned one included. */
+  /** Accounts this request has already exhausted, the one it spent from included. */
   tried: string[]
+  /** The account that hit the limit (the thread's current one, or the pin). */
+  account: string
+  /** Set for a scoped request: the pick is for this thread alone. */
+  thread?: string
+}
+
+export interface RoutedInfo {
+  service: string
+  serviceId: ServiceId
+  thread: string
+  /** The account the thread routes to from now on. */
+  account: string
 }
 
 export interface ForwardHooks {
   /** Every upstream answer, before its body streams back. A 429 carries its body text. */
-  onResponse?: (info: { service: string; path: string; status: number; headers: Headers; body?: string }) => void
+  onResponse?: (info: {
+    service: string
+    path: string
+    status: number
+    headers: Headers
+    body?: string
+    /** The account the answer came from. */
+    account: string | null
+  }) => void
   onError?: (message: string) => void
   /**
-   * The pinned account hit a real limit: name another account with room and
-   * the request replays under it, or return null to pass the 429 through.
-   * The gateway pins the name it gets back; the host never has to.
+   * An account hit a real limit: name another account with room and the
+   * request replays under it, or return null to pass the 429 through. For an
+   * unscoped request the gateway pins the name it gets back; for a scoped one
+   * only that thread moves.
    */
   pickNext?: (info: LimitInfo) => Promise<string | null>
-  /** The first answer that got through after a switch; the host activates `to` now. */
+  /** The first answer that got through after an unscoped switch; the host activates `to` now. */
   onFailedOver?: (info: { service: string; serviceId: ServiceId; from: string; to: string }) => void
+  /** A scoped thread routes to a different account from now on (override set or dropped). */
+  onRouted?: (info: RoutedInfo) => void
 }
 
 /** Replays per request: past this the 429 goes to the client as it came. */
@@ -373,15 +451,16 @@ export interface ForwardOutcome {
 }
 
 /**
- * Forward one request under the pinned account and stream the answer back.
- * Returns the upstream status, or null when nothing reached upstream.
+ * Forward one request and stream the answer back: under the thread's account
+ * when the path carries a scope, else under the pinned one. Returns the
+ * upstream status, or null when nothing reached upstream.
  */
 export async function forward(
   req: IncomingMessage,
   res: ServerResponse,
   on: ForwardHooks = {}
 ): Promise<ForwardOutcome> {
-  const { service, rest } = splitPath(req.url ?? '/')
+  const { service, rest, scope } = splitPath(req.url ?? '/')
   const upstream = upstreamFor(service, rest)
   if (!upstream) {
     fail(res, 404, `unknown service "${service}"`)
@@ -390,16 +469,50 @@ export async function forward(
 
   const body = ['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req)
   const serviceId = serviceIdOf(service)
+  const model = modelOf(body)
   const tried: string[] = []
   let switchedFrom: string | null = null
   let upstreamRes: Response
   let rejected: string | undefined
 
-  // The replay loop: a real limit on the pinned account pins another (when the
-  // host names one) and sends the same bytes again. Bounded, and never for a
-  // transient 429, which the CLI retries itself.
+  // A scoped request spends from the thread's account: the one its URL names,
+  // unless failover moved the thread. Both are checked against the cache
+  // before anything goes out, so a thread never sends a request it is known
+  // to lose.
+  let target: string | null = null
+  if (scope && serviceId) {
+    const now = Date.now()
+    const tiers = tiersFor(serviceId, model)
+    target = routes.get(scope.thread) ?? scope.account
+    const route = (account: string): void => {
+      if (account === scope.account) routes.delete(scope.thread)
+      else routes.set(scope.thread, account)
+      target = account
+      on.onRouted?.({ service, serviceId, thread: scope.thread, account })
+    }
+    // A pinned thread goes back to its pin as soon as the pin has room again.
+    if (scope.pin && target !== scope.account && !blockedWindow(cachedReport(serviceId, scope.account), tiers, now)) {
+      route(scope.account)
+    }
+    const blocked = on.pickNext ? blockedWindow(cachedReport(serviceId, target), tiers, now) : null
+    if (blocked) {
+      const next = await on
+        .pickNext!({ service, serviceId, model, limit: blocked, tried: [target], account: target, thread: scope.thread })
+        .catch(() => null)
+      if (next && next !== target) route(next)
+    }
+  }
+
+  // The replay loop: a real limit moves the request to another account (when
+  // the host names one) and sends the same bytes again. Bounded, and never for
+  // a transient 429, which the CLI retries itself.
   for (;;) {
-    const credential = await credentialFor(service)
+    if (target && serviceId && !vault.profiles(serviceId).some((p) => p.name === target)) {
+      fail(res, 503, `Aliax has no saved account "${target}" for ${service}. Add it in Aliax or pick another account.`)
+      return { service, status: null }
+    }
+    const account = target ?? (serviceId ? pinnedProfile(serviceId) : null)
+    const credential = await credentialFor(service, target)
     if (!credential) {
       fail(
         res,
@@ -437,20 +550,29 @@ export async function forward(
     // A limit answer is small and worth keeping whole: the hook logs it for the
     // failover fixtures, and the client still gets every byte.
     rejected = upstreamRes.status === 429 ? await upstreamRes.text().catch(() => '') : undefined
-    on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected })
+    on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected, account })
 
-    if (rejected === undefined || !serviceId || !on.pickNext) break
-    const pinned = pinnedProfile(serviceId)
+    if (rejected === undefined || !serviceId || !on.pickNext || !account) break
     const limit = classify429(service, upstreamRes.headers, rejected)
-    if (!pinned || limit.window === 'transient') break
-    observeLimit(serviceId, pinned, limit)
+    if (limit.window === 'transient') break
+    observeLimit(serviceId, account, limit)
     if (tried.length >= MAX_REPLAYS) break
-    tried.push(pinned)
-    const next = await on.pickNext({ service, serviceId, model: modelOf(body), limit, tried: [...tried] }).catch(() => null)
-    if (!next || next === pinned || tried.includes(next)) break
+    tried.push(account)
+    const next = await on
+      .pickNext({ service, serviceId, model, limit, tried: [...tried], account, thread: scope?.thread })
+      .catch(() => null)
+    if (!next || next === account || tried.includes(next)) break
+    if (scope) {
+      // Only this thread moves; the pin is the terminal CLIs' business.
+      if (next === scope.account) routes.delete(scope.thread)
+      else routes.set(scope.thread, next)
+      target = next
+      on.onRouted?.({ service, serviceId, thread: scope.thread, account: next })
+      continue
+    }
     // Sticky by design: the pin moves only here or on a user's click, never on success.
     pinProfile(serviceId, next)
-    switchedFrom ??= pinned
+    switchedFrom ??= account
     hooks().onAccountsChanged?.()
   }
   if (switchedFrom && serviceId && upstreamRes.status < 400) {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { candidates, hasRoom, limitLabel, orderByReset, pickNext, requiredTiers, tiersFor, weeklyLabel } from '../src/gateway/failover'
+import { blockedWindow, candidates, hasRoom, limitLabel, orderByReset, orderLabel, pickFromCache, pickNext, requiredTiers, tiersFor, weeklyLabel, windowOfLabel } from '../src/gateway/failover'
 import { classify429 } from '../src/gateway/limits'
 import type { UsageReport } from '../src/shared/types'
 
@@ -57,6 +57,33 @@ describe('room and ordering', () => {
     const profiles = ['week-late', 'week-soon'].map((name) => ({ name }))
     expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: [], now: NOW })).toEqual(['week-soon', 'week-late'])
   })
+  it('a scoped pick orders by the model\'s own window, falling back to the week when absent; ties go to the fuller account', () => {
+    expect(orderLabel('claude-code', 'claude-fable-5-1')).toBe('Fable')
+    expect(orderLabel('claude-code', 'claude-opus-5-5')).toBe('Weekly')
+    expect(orderLabel('codex', 'gpt-6-astra')).toBe('week')
+    const reports = [
+      report('fable-late', [{ label: 'Weekly', usedPercent: 10, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 40, resetsAt: NOW + 9_000 }]),
+      report('fable-soon', [{ label: 'Weekly', usedPercent: 10, resetsAt: NOW + 9_000 }, { label: 'Fable', usedPercent: 40, resetsAt: NOW + 1_000 }]),
+      report('fable-soon-fuller', [{ label: 'Weekly', usedPercent: 10, resetsAt: NOW + 9_000 }, { label: 'Fable', usedPercent: 80, resetsAt: NOW + 1_000 }]),
+      report('no-fable', [{ label: 'Weekly', usedPercent: 10, resetsAt: NOW + 500 }])
+    ]
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly', 'Fable'], tried: [], now: NOW, orderBy: 'Fable' })).toEqual([
+      'no-fable',
+      'fable-soon-fuller',
+      'fable-soon',
+      'fable-late'
+    ])
+  })
+  it('blockedWindow names the full window as a limit, and the label maps back to a window', () => {
+    expect(blockedWindow(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h', 'Weekly'], NOW)).toEqual({ window: '5h', resetsAt: NOW + 1 })
+    expect(blockedWindow(report('a', [{ label: 'Fable', usedPercent: 100 }]), ['5h', 'Weekly', 'Fable'], NOW)).toEqual({ window: { model: 'Fable' }, resetsAt: undefined })
+    expect(blockedWindow(report('a', [{ label: 'week', usedPercent: 100 }]), ['5h', 'week'], NOW)).toEqual({ window: 'weekly', resetsAt: undefined })
+    expect(blockedWindow(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW - 1 }]), ['5h'], NOW)).toBeNull()
+    expect(blockedWindow(undefined, ['5h'], NOW)).toBeNull()
+    expect(windowOfLabel('claude-code', 'Credits')).toBe('credits')
+    expect(windowOfLabel('codex', 'week')).toBe('weekly')
+  })
   it('candidates drop tried, expired and full accounts', () => {
     const reports = [
       report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 9 }]),
@@ -88,6 +115,19 @@ describe('pickNext', () => {
   it('a poll that learns nothing does not block the pick', async () => {
     const picked = await pickNext({ serviceId: 'claude-code', model: null, liveModels: [], window: '5h', profiles, reports, tried: ['a'], poll: async () => null, now: NOW })
     expect(picked).toBe('b')
+  })
+  it('a scoped pick ignores live models and reads the cache without polling', async () => {
+    const poll = vi.fn(async () => null)
+    const withFable = [
+      report('a', [{ label: '5h', usedPercent: 10 }, { label: 'Weekly', usedPercent: 10, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 9 }]),
+      report('b', [{ label: '5h', usedPercent: 10 }, { label: 'Weekly', usedPercent: 10, resetsAt: NOW + 5 }])
+    ]
+    // Unscoped, with a Fable thread live: a's full Fable cap rules it out.
+    expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], window: '5h', profiles, reports: withFable, tried: [], poll, now: NOW })).toBe('b')
+    // Scoped to an Opus thread: a is fine, and it resets sooner.
+    expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], scoped: true, window: '5h', profiles, reports: withFable, tried: [], poll, now: NOW })).toBe('a')
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: [], now: NOW })).toBe('b')
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: ['b', 'c'], now: NOW })).toBeNull()
   })
   it('null when every account is tried or full', async () => {
     const picked = await pickNext({ serviceId: 'claude-code', model: null, liveModels: [], window: '5h', profiles, reports, tried: ['a', 'b', 'c'], poll: async () => null, now: NOW })

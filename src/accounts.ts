@@ -511,6 +511,11 @@ export async function usageOf(serviceId: ServiceId, name: string, force = false)
   return pollProfile(a, p, await activeProfileName(a), force)
 }
 
+/** The report the cache holds for one profile, however old; undefined when none. */
+export function cachedReport(serviceId: ServiceId, name: string): UsageReport | undefined {
+  return cache().get(`${serviceId}:${name}`)?.report
+}
+
 /** Mark one cached report stale so the next poll goes to the network, keeping its numbers. */
 export function markUsageStale(serviceId: ServiceId, name: string): void {
   const key = `${serviceId}:${name}`

@@ -5,13 +5,20 @@ import type { Owner } from './marker'
 
 /**
  * The gateway's own endpoints, answered by whichever app owns the marker:
- *   GET /__aliax                       liveness: { ok, pid, owner }
+ *   GET /__aliax                       liveness: { ok, pid, owner, features }
  *   GET /__aliax/usage?service=<id>[&force=1]
  *                                      poll (or serve) usage for one service;
  *                                      a standby forwards its Refresh here so
  *                                      one poller writes the shared cache.
  * Returns false when the path is not a control path.
  */
+/**
+ * What this gateway understands beyond plain forwarding, so a host in front
+ * of an older owner can fall back:
+ *   scoped-routes  the `~t=…;a=…` path segment (per-thread accounts)
+ */
+export const FEATURES = ['scoped-routes'] as const
+
 export async function handleControl(
   req: IncomingMessage,
   res: ServerResponse,
@@ -19,7 +26,7 @@ export async function handleControl(
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   if (url.pathname === '/__aliax') {
-    json(res, 200, { ok: true, pid: process.pid, owner })
+    json(res, 200, { ok: true, pid: process.pid, owner, features: FEATURES })
     return true
   }
   if (url.pathname === '/__aliax/usage') {
