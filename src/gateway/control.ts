@@ -10,6 +10,8 @@ import type { Owner } from './marker'
  *                                      poll (or serve) usage for one service;
  *                                      a standby forwards its Refresh here so
  *                                      one poller writes the shared cache.
+ * Both also answer under a service prefix (`/claude/__aliax`), the only
+ * paths the shim forwards, so a host can probe the owner through it.
  * Returns false when the path is not a control path.
  */
 /**
@@ -25,6 +27,7 @@ export async function handleControl(
   owner: Owner
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+  url.pathname = url.pathname.replace(/^\/(?:claude|codex)(?=\/__aliax)/, '')
   if (url.pathname === '/__aliax') {
     json(res, 200, { ok: true, pid: process.pid, owner, features: FEATURES })
     return true

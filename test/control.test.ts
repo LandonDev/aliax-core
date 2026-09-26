@@ -20,5 +20,8 @@ describe('control', () => {
     const body = await (await fetch(`http://127.0.0.1:${port}/__aliax`)).json()
     expect(body).toMatchObject({ ok: true, pid: process.pid, features: ['scoped-routes'] })
     expect(FEATURES).toContain('scoped-routes')
+    // Through the shim only service paths get forwarded: the same answer under a prefix.
+    expect(await (await fetch(`http://127.0.0.1:${port}/claude/__aliax`)).json()).toMatchObject({ features: ['scoped-routes'] })
+    expect(await (await fetch(`http://127.0.0.1:${port}/codex/__aliax`)).json()).toMatchObject({ ok: true })
   })
 })
