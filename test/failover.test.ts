@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { blockedWindow, candidates, hasRoom, limitLabel, orderByReset, orderLabel, pickFromCache, pickNext, requiredTiers, tiersFor, weeklyLabel, windowOfLabel } from '../src/gateway/failover'
+import { blockedWindow, candidates, hasRoom, limitLabel, liveWindow, orderByReset, orderLabel, pickFromCache, pickNext, requiredTiers, scopedSpent, spendFirstLabels, tiersFor, weeklyLabel, windowOfLabel } from '../src/gateway/failover'
 import { classify429 } from '../src/gateway/limits'
 import type { UsageReport } from '../src/shared/types'
 
@@ -74,6 +74,56 @@ describe('room and ordering', () => {
       'fable-soon',
       'fable-late'
     ])
+  })
+  it('a lifted window sorts as unknown, never soonest, and counts as absent', () => {
+    const reports = [
+      report('stale', [{ label: 'Weekly', usedPercent: 100, resetsAt: NOW - 1 }]),
+      report('soon', [{ label: 'Weekly', usedPercent: 50, resetsAt: NOW + 1_000 }]),
+      report('unknown', [{ label: 'Weekly', usedPercent: 10 }])
+    ]
+    const names = reports.map((r) => r.profileName).sort(orderByReset('Weekly', reports, NOW))
+    expect(names).toEqual(['soon', 'unknown', 'stale'])
+    expect(liveWindow(reports[0], 'Weekly', NOW)).toBeUndefined()
+    expect(liveWindow(reports[1], 'Weekly', NOW)?.usedPercent).toBe(50)
+  })
+  it('a model without a scoped cap spends the accounts whose Fable window is gone first; Fable still needs Fable room', () => {
+    expect(spendFirstLabels('claude-code', 'claude-opus-5-5')).toEqual(['Fable'])
+    expect(spendFirstLabels('claude-code', 'claude-fable-5-1')).toEqual([])
+    expect(spendFirstLabels('codex', 'gpt-6-astra')).toEqual([])
+    expect(spendFirstLabels('claude-code', null)).toEqual([])
+    const reports = [
+      report('fresh', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1_000 }, { label: 'Fable', usedPercent: 5, resetsAt: NOW + 1_000 }]),
+      report('spent', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1_000 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 1_000 }]),
+      report('half', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 500 }, { label: 'Fable', usedPercent: 60, resetsAt: NOW + 500 }]),
+      report('no-fable', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1 }]),
+      report('lifted', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 2 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW - 1 }])
+    ]
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    const pick = (model: string, tried: string[] = []): string | null => pickFromCache({ serviceId: 'claude-code', model, scoped: true, profiles, reports, tried, now: NOW })
+    // Opus: the spent Fable window first, then the fuller one; no Fable window and a lifted one are full room, ordered by the week.
+    expect(pick('claude-opus-5-5')).toBe('spent')
+    expect(pick('claude-opus-5-5', ['spent'])).toBe('half')
+    expect(pick('claude-opus-5-5', ['spent', 'half'])).toBe('fresh')
+    expect(pick('claude-opus-5-5', ['spent', 'half', 'fresh'])).toBe('no-fable')
+    expect(pick('claude-opus-5-5', ['spent', 'half', 'fresh', 'no-fable'])).toBe('lifted')
+    // Fable: room in its own window is required, soonest Fable reset first; the spent account never comes up.
+    expect(pick('claude-fable-5-1')).toBe('no-fable')
+    expect(pick('claude-fable-5-1', ['no-fable', 'lifted'])).toBe('half')
+    expect(pick('claude-fable-5-1', ['no-fable', 'lifted', 'half', 'fresh'])).toBeNull()
+    // The class a host watches: spent, or has room (a lifted or absent window has room).
+    expect(scopedSpent('claude-code', 'claude-opus-5-5', reports[1], NOW)).toBe(true)
+    expect(scopedSpent('claude-code', 'claude-opus-5-5', reports[0], NOW)).toBe(false)
+    expect(scopedSpent('claude-code', 'claude-opus-5-5', reports[4], NOW)).toBe(false)
+    expect(scopedSpent('claude-code', 'claude-opus-5-5', undefined, NOW)).toBe(false)
+    expect(scopedSpent('claude-code', 'claude-fable-5-1', reports[1], NOW)).toBeNull()
+  })
+  it('an unscoped pick keeps the weekly order whatever the Fable windows say', () => {
+    const reports = [
+      report('fresh-soon', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 5, resetsAt: NOW + 1 }]),
+      report('spent-late', [{ label: 'Weekly', usedPercent: 20, resetsAt: NOW + 9_000 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 9_000 }])
+    ]
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-opus-5-5', profiles, reports, tried: [], now: NOW })).toBe('fresh-soon')
   })
   it('blockedWindow names the full window as a limit, and the label maps back to a window', () => {
     expect(blockedWindow(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h', 'Weekly'], NOW)).toEqual({ window: '5h', resetsAt: NOW + 1 })
