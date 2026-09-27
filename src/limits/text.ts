@@ -5,6 +5,10 @@
  *
  * Templates come from the CLI binaries:
  *  Claude  "You've hit your session limit · resets 6:20am (America/Chicago)"
+ *          the /usage summary, when the CLI answers a send with it:
+ *          "Current session: 100% used · resets Sep 26 at 7:20pm (…)"
+ *          "Current week (all models): 37% used · resets Oct 2 at 12am (…)"
+ *          "Current week (Fable): 67% used · resets …"
  *          "You've hit your weekly limit · resets …"
  *          "You've reached your Fable limit. Switch to another model…"
  *          "You're out of usage credits." / "monthly spend limit" /
@@ -45,6 +49,24 @@ const CODEX: Rule[] = [
 
 const cap = (s: string): string => s[0].toUpperCase() + s.slice(1).toLowerCase()
 
+/**
+ * The window a usage summary says is closed: the line at 100%. Several at
+ * 100% name the most specific one, a model's own window before the week
+ * before the session, since that is the one a pick can route around.
+ * Lines under 100% are not limits; a text with no summary lines is null.
+ */
+function summaryLimit(text: string): LimitWindow | null {
+  let found: { rank: number; window: LimitWindow } | null = null
+  for (const m of text.matchAll(/current (session|week)(?: \(([^)]+)\))?: (\d+)% used/gi)) {
+    if (Number(m[3]) < 100) continue
+    const scope = m[2]?.trim()
+    const [rank, window]: [number, LimitWindow] =
+      m[1].toLowerCase() === 'session' ? [0, '5h'] : !scope || /^all models$/i.test(scope) ? [1, 'weekly'] : [2, { model: cap(scope) }]
+    if (!found || rank > found.rank) found = { rank, window }
+  }
+  return found?.window ?? null
+}
+
 /** The message inside an API error body when the text is one; else the text. */
 function unwrap(text: string): { text: string; apiError: boolean } {
   const start = text.indexOf('{')
@@ -62,6 +84,10 @@ function unwrap(text: string): { text: string; apiError: boolean } {
 
 export function classifyLimitText(provider: TextProvider, message: string): TextLimit | null {
   const { text, apiError } = unwrap(message)
+  if (provider === 'claude') {
+    const summary = summaryLimit(text)
+    if (summary) return { window: summary }
+  }
   for (const [re, window] of provider === 'claude' ? CLAUDE : CODEX) {
     const m = text.match(re)
     if (m) return { window: window(m) }

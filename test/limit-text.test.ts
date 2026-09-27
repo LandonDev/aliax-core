@@ -1,6 +1,39 @@
 import { describe, expect, it } from 'vitest'
 import { classifyLimitText } from '../src/limits/text'
 
+const USAGE_SUMMARY = [
+  'You are currently using your subscription to power your Claude Code usage',
+  '',
+  'Current session: 100% used · resets Sep 26 at 7:20pm (America/Chicago)',
+  'Current week (all models): 37% used · resets Oct 2 at 12am (America/Chicago)',
+  'Current week (Fable): 67% used · resets Oct 2 at 12am (America/Chicago)',
+  '',
+  "What's contributing to your limits usage?",
+  'Approximate, based on local sessions on this machine — does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.',
+  '',
+  'Last 24h · 2454 requests · 80 sessions',
+  '  71% of your usage was at >150k context',
+  '  71% of your usage was while 4+ sessions ran in parallel',
+  '  19% of your usage came from subagent-heavy sessions',
+  '  Top skills: /codex-review 5%',
+  '  Top subagents: general-purpose 15%',
+  '  Top MCP servers: cosmic-admin 6%, orchestrator 4%, app 1%',
+  '',
+  'Last 7d · 40629 requests · 675 sessions',
+  '  77% of your usage was while 4+ sessions ran in parallel',
+  '  74% of your usage was at >150k context',
+  '  11% of your usage came from sessions active for 8+ hours',
+  '  Top skills: /cosmic-minecraft-vibe 7%, /emil-design-eng 4%, /minecraft-display-animations 3%',
+  '  Top subagents: general-purpose 2%, Explore 1%',
+  '  Top MCP servers: cosmic-admin 9%, orchestrator 4%, app 1%'
+].join('\n')
+
+/** The summary with the given window lines at the given percentages. */
+const summary = (session: number, week: number, fable: number): string =>
+  USAGE_SUMMARY.replace('Current session: 100%', `Current session: ${session}%`)
+    .replace('(all models): 37%', `(all models): ${week}%`)
+    .replace('(Fable): 67%', `(Fable): ${fable}%`)
+
 describe('classifyLimitText: Claude', () => {
   it('names the window the CLI synthetic message names', () => {
     expect(classifyLimitText('claude', "You've hit your session limit · resets 6:20am (America/Chicago)")).toEqual({ window: '5h' })
@@ -31,6 +64,19 @@ describe('classifyLimitText: Claude', () => {
     expect(classifyLimitText('claude', 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')).toEqual({
       window: 'transient'
     })
+  })
+  it('the usage summary names the window at 100%: the session, the week, or a model\'s own', () => {
+    expect(classifyLimitText('claude', USAGE_SUMMARY)).toEqual({ window: '5h' })
+    expect(classifyLimitText('claude', summary(12, 100, 67))).toEqual({ window: 'weekly' })
+    expect(classifyLimitText('claude', summary(12, 37, 100))).toEqual({ window: { model: 'Fable' } })
+  })
+  it('several summary lines at 100% name the most specific: a model before the week before the session', () => {
+    expect(classifyLimitText('claude', summary(100, 100, 100))).toEqual({ window: { model: 'Fable' } })
+    expect(classifyLimitText('claude', summary(100, 100, 67))).toEqual({ window: 'weekly' })
+    expect(classifyLimitText('claude', summary(100, 37, 100))).toEqual({ window: { model: 'Fable' } })
+  })
+  it('a summary with every line under 100% is not a limit', () => {
+    expect(classifyLimitText('claude', summary(99, 37, 67))).toBeNull()
   })
   it('anything else is not a limit', () => {
     expect(classifyLimitText('claude', 'Prompt is too long')).toBeNull()
