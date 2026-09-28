@@ -50,6 +50,36 @@ describe('accounts.usage cache gates', () => {
     expect(usage).toHaveBeenCalledTimes(1)
   })
 
+  it('one 429 with a retry-after stops the sweep from knocking the rest; they serve cache unmarked', async () => {
+    ;({ cleanup } = tempCore())
+    for (const name of ['a', 'b', 'c']) {
+      vault.upsertProfile('codex', { name, accountId: name, createdAt: 1 })
+      vault.saveSecret('codex', name, '{}')
+    }
+    const ok = { windows: [{ label: '5h', usedPercent: 10 }] }
+    const usage = vi.fn(async () => ok)
+    stubCodex(usage)
+    // A first sweep fills the cache for all three.
+    await accounts.usage('codex', true)
+    expect(usage).toHaveBeenCalledTimes(3)
+    // The next sweep is throttled on its first account.
+    usage.mockResolvedValueOnce({ windows: [], note: 'usage temporarily unavailable', retryAfterMs: 40 } as never)
+    const marked = await accounts.usage('codex', true)
+    expect(usage).toHaveBeenCalledTimes(4)
+    expect(marked.map((r) => r.profileName)).toEqual(['a', 'b', 'c'])
+    expect(marked[0].rateLimit?.until).toBeGreaterThan(Date.now())
+    expect(marked[0].windows).toEqual(ok.windows)
+    expect(marked[1].rateLimit).toBeUndefined()
+    expect(marked[2].rateLimit).toBeUndefined()
+    expect(marked[1].windows).toEqual(ok.windows)
+    expect(accounts.cachedReport('codex', 'b')?.rateLimit).toBeUndefined()
+    // After the retry-after, a sweep polls all three again.
+    await new Promise((r) => setTimeout(r, 60))
+    const after = await accounts.usage('codex', true)
+    expect(usage).toHaveBeenCalledTimes(7)
+    expect(after.every((r) => r.rateLimit === undefined)).toBe(true)
+  })
+
   it('a poll writes the cache without firing onAccountsChanged', async () => {
     const onAccountsChanged = vi.fn()
     ;({ cleanup } = tempCore({ hooks: { onAccountsChanged } }))

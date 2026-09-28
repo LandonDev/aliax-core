@@ -490,9 +490,20 @@ export async function usage(serviceId: ServiceId, force = false): Promise<UsageR
   // One account at a time. Every profile in a service hits the same host, and
   // firing them together earns a 429 that leaves later accounts with no usage
   // and no plan — which is exactly how three of four Claude rows came up blank.
+  // The throttle is on the host, not the token: once one account's poll
+  // answers 429 with a retry-after, the rest of this sweep would too, and each
+  // would carry its own mark. They serve their cache unmarked instead; the
+  // next sweep after the retry-after knocks again.
   const reports: UsageReport[] = []
-  for (const p of vault.profiles(serviceId)) reports.push(await pollProfile(a, p, active, force))
+  const sweep: Sweep = {}
+  for (const p of vault.profiles(serviceId)) reports.push(await pollProfile(a, p, active, force, sweep))
   return reports
+}
+
+/** State one `usage()` sweep shares across its profiles. */
+interface Sweep {
+  /** Set by the first 429 with a retry-after; later profiles skip the network until it. */
+  throttledUntil?: number
 }
 
 /**
@@ -525,7 +536,7 @@ export function markUsageStale(serviceId: ServiceId, name: string): void {
   persistCache()
 }
 
-async function pollProfile(a: Adapter, p: { name: string }, active: string | null, force: boolean): Promise<UsageReport> {
+async function pollProfile(a: Adapter, p: { name: string }, active: string | null, force: boolean, sweep: Sweep = {}): Promise<UsageReport> {
   const serviceId = a.id
   const ttl = USAGE_TTL[serviceId] ?? DEFAULT_TTL
   const now = Date.now()
@@ -541,6 +552,14 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
   // freshness check below kept serving the limited report for the rest of
   // the TTL, which is why the line sat on "retrying…" and never retried.
   const limitFinished = until !== undefined && until <= now
+
+  // An earlier account in this sweep was throttled: this one would be too.
+  // Serve what the cache holds, unmarked and as fresh as it was, and knock
+  // again next sweep.
+  if (sweep.throttledUntil !== undefined && sweep.throttledUntil > now) {
+    if (cached) return limitFinished ? { ...cached.report, rateLimit: undefined } : cached.report
+    return { profileName: p.name, windows: [], note: 'usage temporarily unavailable' }
+  }
 
   // Otherwise honour the freshness cache, unless the user forced a poll.
   if (!force && !limitFinished && cached && !cached.stale && now - cached.at < ttl) {
@@ -605,6 +624,7 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
         ? cached.report
         : { profileName: p.name, windows: [] as UsageWindow[] }
       const limitUntil = result.retryAfterMs !== undefined ? now + result.retryAfterMs : undefined
+      if (limitUntil !== undefined) sweep.throttledUntil = limitUntil
       const merged: UsageReport = {
         ...base,
         profileName: p.name,
