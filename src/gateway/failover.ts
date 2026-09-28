@@ -126,17 +126,21 @@ export const hasRoom = (report: UsageReport | undefined, tiers: string[], now: n
 /**
  * Soonest-to-reset first in the given window; an account with no such window
  * on file orders by its weekly reset instead (a plan without that cap), then
- * ones with no reset at all, and ones whose usage endpoint is itself limited
- * after those. Ties go to the account that has used more of the window, so
- * the one about to refill anyway gets spent first. A lifted window (reset in
- * the past) counts as absent, not soonest. `spendFirst` windows lead the
- * order: the account with the least room left in them first (a full one
- * ahead of a fresh one; no such window is full room).
+ * ones with no reset at all, and ones with no windows at all whose usage
+ * endpoint is itself limited after those (their numbers are unknown). A
+ * usage-poll throttle on an account with windows on file does not move it:
+ * that 429 is the usage endpoint, not the model API, and the cached windows
+ * still say how much room it has. Ties go to the account that has used more
+ * of the window, so the one about to refill anyway gets spent first. A lifted
+ * window (reset in the past) counts as absent, not soonest. `spendFirst`
+ * windows lead the order: the account with the least room left in them first
+ * (a full one ahead of a fresh one; no such window is full room).
  */
 export function orderByReset(label: string | null, reports: UsageReport[], now: number, weekly: string | null = null, spendFirst: string[] = []) {
   const key = (name: string): number[] => {
     const r = reports.find((x) => x.profileName === name)
-    const limited = r?.rateLimit?.until !== undefined && r.rateLimit.until > now ? 1 : 0
+    const marked = r?.rateLimit?.until !== undefined && r.rateLimit.until > now
+    const limited = marked && r.windows.length === 0 ? 1 : 0
     const w = (label && liveWindow(r, label, now)) || (weekly && liveWindow(r, weekly, now)) || undefined
     const spent = spendFirst.reduce((sum, l) => sum + (liveWindow(r, l, now)?.usedPercent ?? 0), 0)
     return [limited, -spent, w?.resetsAt ?? 1e14, -(w?.usedPercent ?? 0)]

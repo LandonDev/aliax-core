@@ -38,16 +38,31 @@ describe('room and ordering', () => {
     expect(hasRoom(report('a', [{ label: '5h', usedPercent: 1 }], { expired: true }), ['5h'], NOW)).toBe(false)
     expect(hasRoom(report('a', [{ label: 'Credits', usedPercent: 100 }]), ['5h'], NOW)).toBe(false)
   })
-  it('orders by the weekly reset, unknown last, usage-limited after that; no floor on how full', () => {
+  it('orders by the weekly reset, unknown last, then a usage-limited account with no windows; no floor on how full', () => {
     const reports = [
       report('late', [{ label: 'Weekly', usedPercent: 90, resetsAt: NOW + 3_000 }]),
       report('soon', [{ label: 'Weekly', usedPercent: 99, resetsAt: NOW + 1_000 }]),
       report('unknown', [{ label: 'Weekly', usedPercent: 10 }]),
-      report('limited', [{ label: 'Weekly', usedPercent: 0, resetsAt: NOW + 500 }], { rateLimit: { provider: 'x', until: NOW + 60_000 } })
+      report('blank-limited', [], { rateLimit: { provider: 'x', until: NOW + 60_000 } }),
+      report('blank', [])
     ]
     const names = reports.map((r) => r.profileName).sort(orderByReset(weeklyLabel('claude-code'), reports, NOW))
-    expect(names).toEqual(['soon', 'late', 'unknown', 'limited'])
+    expect(names).toEqual(['soon', 'late', 'unknown', 'blank', 'blank-limited'])
     expect(weeklyLabel('codex')).toBe('week')
+  })
+  it('a usage-poll throttle on an account with windows on file leaves it where its windows put it', () => {
+    const mark = { rateLimit: { provider: 'x', until: NOW + 60_000 } }
+    const reports = [
+      report('late', [{ label: 'Weekly', usedPercent: 40, resetsAt: NOW + 9_000 }, { label: 'Fable', usedPercent: 40, resetsAt: NOW + 9_000 }]),
+      report('soon-marked', [{ label: 'Weekly', usedPercent: 30, resetsAt: NOW + 1_000 }, { label: 'Fable', usedPercent: 45, resetsAt: NOW + 1_000 }], mark),
+      report('spent-marked', [{ label: 'Weekly', usedPercent: 30, resetsAt: NOW + 5_000 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 5_000 }], mark)
+    ]
+    expect(reports.map((r) => r.profileName).sort(orderByReset('Weekly', reports, NOW))).toEqual(['soon-marked', 'spent-marked', 'late'])
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    // Fable: the marked account with the soonest Fable reset and room still leads.
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports, tried: [], now: NOW })).toBe('soon-marked')
+    // Opus: the marked account whose Fable window is spent still leads.
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-opus-5-5', scoped: true, profiles, reports, tried: [], now: NOW })).toBe('spent-marked')
   })
   it('a 5h limit still orders by the weekly reset, never the 5h one', () => {
     const reports = [
