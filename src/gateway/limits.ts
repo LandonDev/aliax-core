@@ -6,8 +6,21 @@
  * utilization is a 0..1 fraction (it can pass 1), resets are epoch seconds.
  * Codex has no such headers; its windows arrive as an app-server snapshot.
  */
-import type { UsageWindow } from '../shared/types'
+import type { ServiceId, UsageWindow } from '../shared/types'
 import { windowLabel } from '../adapters/codex'
+
+/**
+ * Model families that carry their own weekly cap in Claude's `limits` array.
+ * Extend when a new scoped cap shows up there; an absent cap counts as room.
+ */
+export const SCOPED_CAPS: [RegExp, string][] = [[/fable/i, 'Fable']]
+
+/** The label of the model's own weekly cap (Fable for a Fable model), null when it has none. */
+export function scopedCapOf(serviceId: ServiceId, model: string | null | undefined): string | null {
+  if (serviceId !== 'claude-code' || !model) return null
+  for (const [re, label] of SCOPED_CAPS) if (re.test(model)) return label
+  return null
+}
 
 export interface HeaderLike {
   get(name: string): string | null
@@ -27,10 +40,17 @@ export interface UnifiedLimits {
 }
 
 const PREFIX = 'anthropic-ratelimit-unified'
+const WEEK_MS = 7 * 86_400_000
 const ROLLING: [key: string, label: string, periodMs: number][] = [
   ['5h', '5h', 5 * 3_600_000],
-  ['7d', 'Weekly', 7 * 86_400_000]
+  ['7d', 'Weekly', WEEK_MS]
 ]
+/**
+ * The model's own weekly cap rides as `7d_oi` ("overage included"): only a
+ * response for a scoped model (Fable) carries it, and its reset matches the
+ * usage poll's Fable window exactly, so it lands under that window's label.
+ */
+const SCOPED_KEY = '7d_oi'
 
 const num = (v: string | null): number | undefined => {
   if (v === null || v.trim() === '') return undefined
@@ -45,12 +65,17 @@ const percent = (fraction: number): number => Math.round(fraction * 1000) / 10
 const isStatus = (v: string | null): v is UnifiedStatus =>
   v === 'allowed' || v === 'allowed_warning' || v === 'rejected'
 
-/** Null when the response carries no unified headers at all. */
-export function parseUnifiedHeaders(headers: HeaderLike): UnifiedLimits | null {
+/**
+ * Null when the response carries no unified headers at all. `scopedLabel` is
+ * the requesting model's own cap (`scopedCapOf`): the `7d_oi` window lands
+ * under it, and is dropped when the model has none.
+ */
+export function parseUnifiedHeaders(headers: HeaderLike, scopedLabel: string | null = null): UnifiedLimits | null {
   const get = (suffix: string): string | null => headers.get(`${PREFIX}-${suffix}`)
   const status = get('status')
   const windows: UsageWindow[] = []
-  for (const [key, label, periodMs] of ROLLING) {
+  const rolling: [string, string, number][] = scopedLabel ? [...ROLLING, [SCOPED_KEY, scopedLabel, WEEK_MS]] : ROLLING
+  for (const [key, label, periodMs] of rolling) {
     const utilization = num(get(`${key}-utilization`))
     if (utilization === undefined) continue
     windows.push({ label, usedPercent: percent(utilization), periodMs, resetsAt: epochMs(get(`${key}-reset`)) })
@@ -125,9 +150,11 @@ export interface Limit {
 }
 
 /**
- * `anthropic-ratelimit-unified-representative-claim` → window. Seeded from
- * the CLI's own window names; a claim the live capture shows that is missing
- * here falls back to its prefix, then to the body text.
+ * `anthropic-ratelimit-unified-representative-claim` → window, for the fixed
+ * claims. Seeded from the CLI's own window names; a claim the live capture
+ * shows that is missing here falls back to its prefix, then to the body text.
+ * `seven_day_overage_included` is model-relative (the `7d_oi` window: the
+ * requesting model's own cap) and is resolved in `classifyClaude` instead.
  */
 export const CLAIM_WINDOWS: Record<string, LimitWindow> = {
   five_hour: '5h',
@@ -146,7 +173,9 @@ const CLAUDE_TEXT: [RegExp, (m: RegExpMatchArray) => LimitWindow][] = [
   [/usage credits|spend limit|out of credits|shared budget|extra usage/i, () => 'credits']
 ]
 
-function classifyClaude(headers: HeaderLike, body: string): Limit {
+const SCOPED_CLAIM = 'seven_day_overage_included'
+
+function classifyClaude(headers: HeaderLike, body: string, model: string | null | undefined): Limit {
   const unified = parseUnifiedHeaders(headers)
   // No unified headers: an edge or overload answer, which the CLI retries itself.
   if (!unified) return { window: 'transient' }
@@ -155,6 +184,8 @@ function classifyClaude(headers: HeaderLike, body: string): Limit {
   if (unified.status === 'rejected' && claim) {
     const known = CLAIM_WINDOWS[claim]
     if (known) return { ...base, window: known }
+    const cap = claim === SCOPED_CLAIM ? scopedCapOf('claude-code', model) : null
+    if (cap) return { ...base, window: { model: cap } }
     if (claim.startsWith('seven_day')) return { ...base, window: 'weekly' }
     if (claim.startsWith('five_hour')) return { ...base, window: '5h' }
   }
@@ -206,9 +237,12 @@ function classifyCodex(body: string): Limit {
   return { window: 'transient', resetsAt }
 }
 
-/** What a 429 from the provider means for the account that sent the request. */
-export function classify429(service: string, headers: HeaderLike, body: string): Limit {
-  if (service === 'claude') return classifyClaude(headers, body)
+/**
+ * What a 429 from the provider means for the account that sent the request.
+ * `model` is the request's, so a claim on the model's own cap charges that cap.
+ */
+export function classify429(service: string, headers: HeaderLike, body: string, model: string | null = null): Limit {
+  if (service === 'claude') return classifyClaude(headers, body, model)
   if (service === 'codex') return classifyCodex(body)
   return { window: 'transient' }
 }

@@ -11,6 +11,7 @@ import { limitLabel } from './gateway/failover'
 import type { Limit } from './gateway/limits'
 import { writeAtomic } from './fs'
 import { enabledTargets } from './settings'
+import { refreshClaude } from './refresh'
 import * as vault from './vault'
 
 export const extra =
@@ -83,6 +84,20 @@ function saveSecretUnlessOlder(a: Adapter, name: string, blob: string): boolean 
   }
   vault.saveSecret(a.id, name, blob)
   return true
+}
+
+/** Whether the vault now holds a strictly newer snapshot of this account than `blob`. */
+function vaultFresherThan(a: Adapter, name: string, blob: string): boolean {
+  if (!a.freshness) return false
+  let stored: string | null = null
+  try {
+    stored = vault.readSecret(a.id, name)
+  } catch {
+    return false
+  }
+  const storedAt = stored ? a.freshness(stored) : null
+  const polledAt = a.freshness(blob)
+  return storedAt !== null && polledAt !== null && storedAt > polledAt
 }
 
 /**
@@ -594,12 +609,28 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
   }
   if (!blob) return { profileName: p.name, windows: [], note: 'app session only. Add account for usage' }
   try {
-    const result = await a.usage(blob, p.name === active, force, role() === 'owner')
-    if (result.updatedBlob) vault.saveSecret(serviceId, p.name, result.updatedBlob)
+    // Only the gateway owner rotates a grant, and only under the same lock
+    // the gateway's own refresh takes (invariant 12).
+    const refresh = role() === 'owner' ? (b: string) => refreshClaude(p.name, b) : null
+    const result = await a.usage(blob, p.name === active, force, refresh)
+    // Never backwards: the gateway may have rotated the token since this poll
+    // read its copy, and a poll's snapshot must not undo that.
+    if (result.updatedBlob) saveSecretUnlessOlder(a, p.name, result.updatedBlob)
 
     // The sign-in is dead: keep the last good windows, flag it so the row
     // offers a same-email re-login, and clear any stale rate-limit line.
     if (result.expired) {
+      // Unless the vault has since gained a fresher token than the one polled:
+      // then the poll raced a refresh and the account is fine. Mark stale so
+      // the next sweep polls the good token, and keep the numbers on file.
+      if (vaultFresherThan(a, p.name, result.updatedBlob ?? blob)) {
+        if (cached) {
+          cache().set(key, { ...cached, stale: true })
+          persistCache()
+          return cached.report
+        }
+        return { profileName: p.name, windows: [], plan: result.plan }
+      }
       const base = cached?.report.windows.length
         ? cached.report
         : { profileName: p.name, windows: [] as UsageWindow[] }

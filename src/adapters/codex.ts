@@ -6,7 +6,7 @@ import { OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
 import type { PlanInfo, UsageWindow } from '../shared/types'
 import { isRunning, launchApp, quitApp } from '../apps'
 import { cliProcesses, killAndWait, reopenSession, terminalOwns } from '../procs'
-import type { Adapter, Captured, UsageResult } from './types'
+import type { Adapter, Captured, RefreshBlob, UsageResult } from './types'
 import { decodeJwtPayload, retryAfterMs } from './types'
 
 const CODEX_DIR = join(homedir(), '.codex')
@@ -282,7 +282,9 @@ export const codex: Adapter = {
     return notes
   },
 
-  async usage(blob: string, isActive: boolean, _force?: boolean, mayRefresh = true): Promise<UsageResult> {
+  async usage(blob: string, isActive: boolean, _force?: boolean, refresh: RefreshBlob | null = null): Promise<UsageResult> {
+    // Codex refreshes in place for now; the callback only says whether we may.
+    const mayRefresh = refresh !== null
     // Resolved up front and attached to every return: the plan lives in the
     // stored token itself, so it should show even when the usage call fails.
     const plan = planFromAuth(blob)

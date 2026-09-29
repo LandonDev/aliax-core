@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as accounts from '../src/accounts'
-import { codexSnapshotToWindows, parseUnifiedHeaders } from '../src/gateway/limits'
+import { classify429, codexSnapshotToWindows, parseUnifiedHeaders, scopedCapOf } from '../src/gateway/limits'
 import { tempCore } from './helpers'
 
 const H = 'anthropic-ratelimit-unified'
@@ -37,6 +37,42 @@ describe('parseUnifiedHeaders', () => {
     const out = parseUnifiedHeaders(new Headers({ [`${H}-status`]: 'allowed_warning', [`${H}-5h-utilization`]: 'nope' }))!
     expect(out).toEqual({ status: 'allowed_warning', windows: [] })
     expect(parseUnifiedHeaders(new Headers({ [`${H}-status`]: 'weird' }))!.status).toBeNull()
+  })
+
+  it('reads 7d_oi as the scoped cap window when the model has one, drops it otherwise', () => {
+    const headers = new Headers({
+      [`${H}-status`]: 'allowed',
+      [`${H}-7d-utilization`]: '0.2',
+      [`${H}-7d-reset`]: '1786500000',
+      [`${H}-7d_oi-utilization`]: '0.63',
+      [`${H}-7d_oi-reset`]: '1786500000'
+    })
+    expect(parseUnifiedHeaders(headers, 'Fable')!.windows).toEqual([
+      { label: 'Weekly', usedPercent: 20, periodMs: 7 * 86_400_000, resetsAt: 1786500000_000 },
+      { label: 'Fable', usedPercent: 63, periodMs: 7 * 86_400_000, resetsAt: 1786500000_000 }
+    ])
+    expect(parseUnifiedHeaders(headers)!.windows.map((w) => w.label)).toEqual(['Weekly'])
+    expect(scopedCapOf('claude-code', 'claude-fable-5-1')).toBe('Fable')
+    expect(scopedCapOf('claude-code', 'claude-opus-5-5')).toBeNull()
+    expect(scopedCapOf('codex', 'fable')).toBeNull()
+  })
+})
+
+describe('classify429 scoped claims', () => {
+  const rejected = (claim: string) =>
+    new Headers({
+      [`${H}-status`]: 'rejected',
+      [`${H}-representative-claim`]: claim,
+      [`${H}-reset`]: '1786500000',
+      [`${H}-7d_oi-status`]: 'rejected',
+      [`${H}-7d-status`]: 'allowed'
+    })
+  const body = '{"type":"error","error":{"type":"rate_limit_error"}}'
+  it('charges seven_day_overage_included to the requesting model\'s cap, or the week without one', () => {
+    expect(classify429('claude', rejected('seven_day_overage_included'), body, 'claude-fable-5-1')).toMatchObject({ window: { model: 'Fable' }, resetsAt: 1786500000_000 })
+    expect(classify429('claude', rejected('seven_day_overage_included'), body, 'claude-opus-5-5').window).toBe('weekly')
+    expect(classify429('claude', rejected('seven_day_overage_included'), body).window).toBe('weekly')
+    expect(classify429('claude', rejected('five_hour'), body, 'claude-fable-5-1').window).toBe('5h')
   })
 })
 

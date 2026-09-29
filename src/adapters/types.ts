@@ -14,6 +14,9 @@ export interface Captured {
 /** Maps a suffix to an absolute path where the adapter may keep a profile-scoped side file. */
 export type ExtraPath = (suffix: string) => string
 
+/** Renew one stored blob; resolves the new blob, or null when it could not be renewed. */
+export type RefreshBlob = (blob: string) => Promise<string | null>
+
 export interface UsageResult {
   windows: UsageWindow[]
   note?: string
@@ -70,10 +73,12 @@ export interface Adapter {
   captureCompanion?(extraFor: (email: string) => ExtraPath): Promise<Captured | null>
   /**
    * `force` is the user's manual Refresh: skip any internal caches too.
-   * `mayRefresh` (default true) lets the adapter renew a stored token in place;
-   * a standby app passes false so only the gateway owner ever rotates a grant.
+   * `refresh` renews a stored blob under the gateway's per-profile lock and
+   * returns the new blob (or null); a standby app passes null so only the
+   * gateway owner ever rotates a grant. Codex keeps its own in-place refresh
+   * and reads a non-null callback as permission.
    */
-  usage(blob: string, isActive: boolean, force?: boolean, mayRefresh?: boolean): Promise<UsageResult>
+  usage(blob: string, isActive: boolean, force?: boolean, refresh?: RefreshBlob | null): Promise<UsageResult>
   /**
    * Token-level identity of the live credentials, for tools whose account metadata file
    * can be clobbered by running sessions. Match against fingerprintOf(blob).

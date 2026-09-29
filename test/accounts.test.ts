@@ -90,14 +90,20 @@ describe('accounts.usage cache gates', () => {
     expect(onAccountsChanged).not.toHaveBeenCalled()
   })
 
-  it('passes mayRefresh=false when the app is standby', async () => {
+  it('passes a refresh callback to the adapter only when the app is the gateway owner', async () => {
     ;({ cleanup } = tempCore({ role: () => 'standby' }))
     vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })
     vault.saveSecret('codex', 'p', '{}')
     const usage = vi.fn(async () => ({ windows: [] }))
     stubCodex(usage)
     await accounts.usage('codex')
-    expect((usage.mock.calls[0] as unknown[])[3]).toBe(false)
+    expect((usage.mock.calls[0] as unknown[])[3]).toBeNull()
+    cleanup()
+    ;({ cleanup } = tempCore({ role: () => 'owner' }))
+    vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })
+    vault.saveSecret('codex', 'p', '{}')
+    await accounts.usage('codex', true)
+    expect(typeof (usage.mock.calls[1] as unknown[])[3]).toBe('function')
   })
 
   it('reloads the cache file when another process rewrote it', async () => {
@@ -139,6 +145,56 @@ describe('saveSecretUnlessOlder', () => {
     expect(accounts.saveSecretUnlessOlder(a, 'p', blob(1000))).toBe(false)
     expect(accounts.saveSecretUnlessOlder(a, 'p', blob(3000))).toBe(true)
     expect(a.freshness!(vault.readSecret('claude-code', 'p')!)).toBe(3000)
+  })
+})
+
+const claudeBlob = (exp: number, extra: Record<string, unknown> = {}): string =>
+  JSON.stringify({ keychain: JSON.stringify({ claudeAiOauth: { accessToken: `T${exp}`, refreshToken: `R${exp}`, expiresAt: exp } }), oauthAccount: { accountUuid: 'u' }, ...extra })
+
+/** Replace the Claude adapter's network-facing pieces with a scripted stand-in. */
+function stubClaude(usage: Adapter['usage']): ReturnType<typeof vi.fn> {
+  const a = accounts.adapterForTest('claude-code')
+  vi.spyOn(a, 'liveAccountId').mockResolvedValue(null)
+  return vi.spyOn(a, 'usage').mockImplementation(usage) as unknown as ReturnType<typeof vi.fn>
+}
+
+describe('pollProfile and the vault', () => {
+  it("a poll's updatedBlob older than the vault is not written", async () => {
+    ;({ cleanup } = tempCore())
+    vault.upsertProfile('claude-code', { name: 'p', accountId: 'u', createdAt: 1 })
+    vault.saveSecret('claude-code', 'p', claudeBlob(2000))
+    stubClaude(async () => ({ windows: [{ label: '5h', usedPercent: 1 }], updatedBlob: claudeBlob(1000) }))
+    await accounts.usage('claude-code', true)
+    expect(vault.readSecret('claude-code', 'p')).toBe(claudeBlob(2000))
+    stubClaude(async () => ({ windows: [{ label: '5h', usedPercent: 1 }], updatedBlob: claudeBlob(3000) }))
+    await accounts.usage('claude-code', true)
+    expect(vault.readSecret('claude-code', 'p')).toBe(claudeBlob(3000))
+  })
+
+  it('an expired result on a blob the vault has since replaced marks stale instead of expired', async () => {
+    const { dataDir, cleanup: c } = tempCore()
+    cleanup = c
+    vault.upsertProfile('claude-code', { name: 'p', accountId: 'u', createdAt: 1 })
+    vault.saveSecret('claude-code', 'p', claudeBlob(1000))
+    const ok = { windows: [{ label: '5h', usedPercent: 10 }] }
+    const usage = stubClaude(async () => ok)
+    await accounts.usage('claude-code', true)
+    // The gateway rotates the token while this poll is out with the old copy.
+    usage.mockImplementationOnce(async () => {
+      vault.saveSecret('claude-code', 'p', claudeBlob(5000))
+      return { windows: [], expired: true }
+    })
+    const [raced] = await accounts.usage('claude-code', true)
+    expect(raced.expired).toBeUndefined()
+    expect(raced.windows).toEqual(ok.windows)
+    expect(JSON.parse(readFileSync(join(dataDir, 'usage-cache.json'), 'utf8'))['claude-code:p'].stale).toBe(true)
+    // The next unforced sweep polls again, with the good token.
+    await accounts.usage('claude-code')
+    expect(usage).toHaveBeenCalledTimes(3)
+    expect((usage.mock.calls[2] as string[])[0]).toBe(claudeBlob(5000))
+    // A genuinely dead token, with nothing fresher on file, still flags expired.
+    usage.mockImplementationOnce(async () => ({ windows: [], expired: true }))
+    expect((await accounts.usage('claude-code', true))[0].expired).toBe(true)
   })
 })
 

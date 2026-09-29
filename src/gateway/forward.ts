@@ -4,7 +4,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { accountIdForToken, liveKeychain } from '../adapters/claude'
 import { fetch, role } from '../config'
-import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
+import { OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
+import { EXPIRY_MARGIN_MS, once, refreshClaude } from '../refresh'
 import { pinProfile, pinnedProfile } from '../settings'
 import { hooks } from '../config'
 import { cachedReport, observeLimit } from '../accounts'
@@ -78,64 +79,16 @@ export interface Credential {
   extraHeaders?: Record<string, string>
 }
 
-/** Refresh a minute before expiry, so a long turn cannot start on a dead token. */
-const EXPIRY_MARGIN_MS = 60_000
-
-/**
- * One refresh at a time per profile. Rotating refresh tokens invalidate their
- * predecessor, so two concurrent refreshes of the same grant would present the
- * same token twice and get it revoked (invariant 12). Different profiles hold
- * different grants and may refresh side by side.
- */
-const refreshing = new Map<string, Promise<void>>()
-
-function once(serviceId: ServiceId, name: string, work: () => Promise<void>): Promise<void> {
-  const key = `${serviceId}:${name}`
-  const existing = refreshing.get(key)
-  if (existing) return existing
-  const p = work().finally(() => refreshing.delete(key))
-  refreshing.set(key, p)
-  return p
-}
-
 /** Renew the pinned Claude profile in place when its access token is expiring. */
 async function refreshClaudeIfNeeded(name: string, blob: string): Promise<void> {
-  let parsed: { keychain?: string; oauthAccount?: unknown }
+  let keychain: string | null
   try {
-    parsed = JSON.parse(blob)
+    keychain = JSON.parse(blob).keychain ?? null
   } catch {
     return
   }
-  const tokens = parsed.keychain ? JSON.parse(parsed.keychain)?.claudeAiOauth : null
-  const expiresAt = typeof tokens?.expiresAt === 'number' ? tokens.expiresAt : 0
-  if (!tokens?.refreshToken || expiresAt - Date.now() > EXPIRY_MARGIN_MS) return
-
-  await once('claude-code', name, async () => {
-    const res = await fetch(CLAUDE_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: tokens.refreshToken,
-        client_id: CLAUDE_CLIENT_ID
-      })
-    }).catch(() => null)
-    if (!res?.ok) return
-    const data = (await res.json()) as {
-      access_token?: string
-      refresh_token?: string
-      expires_in?: number
-    }
-    if (!data.access_token) return
-    const next = {
-      ...tokens,
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token ?? tokens.refreshToken,
-      expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000
-    }
-    const keychain = JSON.stringify({ claudeAiOauth: next })
-    vault.saveSecret('claude-code', name, JSON.stringify({ ...parsed, keychain }))
-  })
+  if (expiryOf(keychain) - Date.now() > EXPIRY_MARGIN_MS) return
+  await refreshClaude(name, blob)
 }
 
 /** Same for Codex, whose access token lasts ten days but still expires. */
@@ -423,6 +376,8 @@ export interface ForwardHooks {
     body?: string
     /** The account the answer came from. */
     account: string | null
+    /** The request body's `model`, when it had one. */
+    model: string | null
   }) => void
   onError?: (message: string) => void
   /**
@@ -556,10 +511,10 @@ export async function forward(
     // A limit answer is small and worth keeping whole: the hook logs it for the
     // failover fixtures, and the client still gets every byte.
     rejected = upstreamRes.status === 429 ? await upstreamRes.text().catch(() => '') : undefined
-    on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected, account })
+    on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected, account, model })
 
     if (rejected === undefined || !serviceId || !on.pickNext || !account) break
-    const limit = classify429(service, upstreamRes.headers, rejected)
+    const limit = classify429(service, upstreamRes.headers, rejected, model)
     if (limit.window === 'transient') break
     observeLimit(serviceId, account, limit)
     if (tried.length >= MAX_REPLAYS) break

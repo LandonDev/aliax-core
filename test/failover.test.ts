@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { blockedWindow, candidates, hasRoom, limitLabel, liveWindow, orderByReset, orderLabel, pickFromCache, pickNext, requiredTiers, scopedSpent, spendFirstLabels, tiersFor, weeklyLabel, windowOfLabel } from '../src/gateway/failover'
+import { DEFAULT_THREAD_CAP, blockedWindow, candidates, hasRoom, limitLabel, liveWindow, orderByReset, orderLabel, pickFromCache, pickNext, requiredTiers, scopedSpent, spendFirstLabels, tiersFor, weeklyLabel, windowOfLabel } from '../src/gateway/failover'
 import { classify429 } from '../src/gateway/limits'
 import type { UsageReport } from '../src/shared/types'
 
@@ -46,7 +46,7 @@ describe('room and ordering', () => {
       report('blank-limited', [], { rateLimit: { provider: 'x', until: NOW + 60_000 } }),
       report('blank', [])
     ]
-    const names = reports.map((r) => r.profileName).sort(orderByReset(weeklyLabel('claude-code'), reports, NOW))
+    const names = reports.map((r) => r.profileName).sort(orderByReset(reports, NOW, { label: weeklyLabel('claude-code') }))
     expect(names).toEqual(['soon', 'late', 'unknown', 'blank', 'blank-limited'])
     expect(weeklyLabel('codex')).toBe('week')
   })
@@ -57,7 +57,7 @@ describe('room and ordering', () => {
       report('soon-marked', [{ label: 'Weekly', usedPercent: 30, resetsAt: NOW + 1_000 }, { label: 'Fable', usedPercent: 45, resetsAt: NOW + 1_000 }], mark),
       report('spent-marked', [{ label: 'Weekly', usedPercent: 30, resetsAt: NOW + 5_000 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 5_000 }], mark)
     ]
-    expect(reports.map((r) => r.profileName).sort(orderByReset('Weekly', reports, NOW))).toEqual(['soon-marked', 'spent-marked', 'late'])
+    expect(reports.map((r) => r.profileName).sort(orderByReset(reports, NOW, { label: 'Weekly' }))).toEqual(['soon-marked', 'spent-marked', 'late'])
     const profiles = reports.map((r) => ({ name: r.profileName }))
     // Fable: the marked account with the soonest Fable reset and room still leads.
     expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports, tried: [], now: NOW })).toBe('soon-marked')
@@ -96,7 +96,7 @@ describe('room and ordering', () => {
       report('soon', [{ label: 'Weekly', usedPercent: 50, resetsAt: NOW + 1_000 }]),
       report('unknown', [{ label: 'Weekly', usedPercent: 10 }])
     ]
-    const names = reports.map((r) => r.profileName).sort(orderByReset('Weekly', reports, NOW))
+    const names = reports.map((r) => r.profileName).sort(orderByReset(reports, NOW, { label: 'Weekly' }))
     expect(names).toEqual(['soon', 'unknown', 'stale'])
     expect(liveWindow(reports[0], 'Weekly', NOW)).toBeUndefined()
     expect(liveWindow(reports[1], 'Weekly', NOW)?.usedPercent).toBe(50)
@@ -157,8 +157,9 @@ describe('room and ordering', () => {
       report('d', [{ label: '5h', usedPercent: 20 }, { label: 'Weekly', usedPercent: 20, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 99 }])
     ]
     const profiles = ['a', 'b', 'c', 'd', 'e'].map((name) => ({ name }))
-    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: ['a'], now: NOW })).toEqual(['d', 'b', 'e'])
-    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly', 'Fable'], tried: ['a'], now: NOW })).toEqual(['b', 'e'])
+    // e has no report: unknown counts as room and as full 5h headroom, so it leads.
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: ['a'], now: NOW })).toEqual(['e', 'd', 'b'])
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly', 'Fable'], tried: ['a'], now: NOW })).toEqual(['e', 'b'])
   })
 })
 
@@ -187,11 +188,14 @@ describe('pickNext', () => {
       report('a', [{ label: '5h', usedPercent: 10 }, { label: 'Weekly', usedPercent: 10, resetsAt: NOW + 1 }, { label: 'Fable', usedPercent: 100, resetsAt: NOW + 9 }]),
       report('b', [{ label: '5h', usedPercent: 10 }, { label: 'Weekly', usedPercent: 10, resetsAt: NOW + 5 }])
     ]
-    // Unscoped, with a Fable thread live: a's full Fable cap rules it out.
-    expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], window: '5h', profiles, reports: withFable, tried: [], poll, now: NOW })).toBe('b')
+    // Unscoped, with a Fable thread live: a's full Fable cap rules it out; c, with no report, reads as full headroom and leads b.
+    expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], window: '5h', profiles, reports: withFable, tried: [], poll, now: NOW })).toBe('c')
+    expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], window: '5h', profiles, reports: withFable, tried: ['c'], poll, now: NOW })).toBe('b')
     // Scoped to an Opus thread: a is fine, and it resets sooner.
     expect(await pickNext({ serviceId: 'claude-code', model: 'claude-opus-5-5', liveModels: ['claude-fable-5-1'], scoped: true, window: '5h', profiles, reports: withFable, tried: [], poll, now: NOW })).toBe('a')
-    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: [], now: NOW })).toBe('b')
+    // c has no report in this set, so it reads as full headroom and leads b's 10% 5h.
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: [], now: NOW })).toBe('c')
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: ['c'], now: NOW })).toBe('b')
     expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-fable-5-1', scoped: true, profiles, reports: withFable, tried: ['b', 'c'], now: NOW })).toBeNull()
   })
   it('null when every account is tried or full', async () => {
@@ -230,5 +234,56 @@ describe('classify429', () => {
     expect(classify429('codex', h({}), JSON.stringify({ error: { code: 'usage_not_included', message: 'add credits' } })).window).toBe('credits')
     expect(classify429('codex', h({}), JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'slow down' } })).window).toBe('transient')
     expect(classify429('codex', h({}), 'not json').window).toBe('transient')
+  })
+})
+
+describe('headroom and load', () => {
+  const weekly = (resetsAt: number) => ({ label: 'Weekly', usedPercent: 20, resetsAt })
+  const fiveH = (usedPercent: number) => ({ label: '5h', usedPercent, resetsAt: NOW + 3_600_000 })
+  const names = (reports: UsageReport[], opts: Partial<Parameters<typeof orderByReset>[2]> = {}): string[] =>
+    reports.map((r) => r.profileName).sort(orderByReset(reports, NOW, { label: 'Weekly', ...opts }))
+
+  it('among accounts with room, the most 5h headroom leads regardless of the reset order', () => {
+    const reports = [
+      report('soon-full', [weekly(NOW + 1), fiveH(80)]),
+      report('late-empty', [weekly(NOW + 9_000), fiveH(5)]),
+      report('mid', [weekly(NOW + 500), fiveH(45)])
+    ]
+    expect(names(reports)).toEqual(['late-empty', 'mid', 'soon-full'])
+  })
+  it('two accounts in the same 10-point bucket order by fewer live threads, then the reset', () => {
+    const reports = [
+      report('busy', [weekly(NOW + 1), fiveH(42)]),
+      report('idle', [weekly(NOW + 9_000), fiveH(48)]),
+      report('idle-soon', [weekly(NOW + 5), fiveH(44)])
+    ]
+    expect(names(reports, { load: { busy: 2 } })).toEqual(['idle-soon', 'idle', 'busy'])
+    expect(names(reports)).toEqual(['busy', 'idle-soon', 'idle'])
+  })
+  it('an account at the cap sorts behind one with less headroom but under it; the cap is soft', () => {
+    const reports = [
+      report('fresh-at-cap', [weekly(NOW + 1), fiveH(0)]),
+      report('used-under-cap', [weekly(NOW + 9_000), fiveH(70)])
+    ]
+    expect(DEFAULT_THREAD_CAP).toBe(3)
+    expect(names(reports, { load: { 'fresh-at-cap': 3 } })).toEqual(['used-under-cap', 'fresh-at-cap'])
+    expect(names(reports, { load: { 'fresh-at-cap': 3 }, cap: 4 })).toEqual(['fresh-at-cap', 'used-under-cap'])
+    // Everyone at the cap: the best headroom still wins, nobody is excluded.
+    expect(names(reports, { load: { 'fresh-at-cap': 3, 'used-under-cap': 5 } })).toEqual(['fresh-at-cap', 'used-under-cap'])
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-opus-5-5', scoped: true, profiles, reports, tried: [], now: NOW, load: { 'fresh-at-cap': 3, 'used-under-cap': 5 } })).toBe('fresh-at-cap')
+  })
+  it('Opus spend-first still beats headroom; a limited account still sorts last', () => {
+    const reports = [
+      report('spent-fable-busy', [weekly(NOW + 1), fiveH(80), { label: 'Fable', usedPercent: 100, resetsAt: NOW + 1 }]),
+      report('fresh', [weekly(NOW + 1), fiveH(0), { label: 'Fable', usedPercent: 5, resetsAt: NOW + 1 }]),
+      report('limited-fresh', [weekly(NOW + 1), fiveH(0)], { rateLimit: { provider: 'x', until: NOW + 60_000 } })
+    ]
+    const profiles = reports.map((r) => ({ name: r.profileName }))
+    expect(candidates({ serviceId: 'claude-code', profiles, reports, required: ['5h', 'Weekly'], tried: [], now: NOW, spendFirst: ['Fable'], load: { 'spent-fable-busy': 2 } })).toEqual([
+      'spent-fable-busy',
+      'fresh',
+      'limited-fresh'
+    ])
   })
 })

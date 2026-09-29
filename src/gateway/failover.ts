@@ -7,25 +7,18 @@
  * every tier those threads will spend, not only the request that hit the wall.
  */
 import type { ProfileView, ServiceId, UsageReport } from '../shared/types'
-import type { Limit, LimitWindow } from './limits'
+import { SCOPED_CAPS, scopedCapOf, type Limit, type LimitWindow } from './limits'
 
 /** The URL segment the gateway routes on → the vault's service id. */
 export const serviceIdOf = (service: string): ServiceId | null =>
   service === 'claude' ? 'claude-code' : service === 'codex' ? 'codex' : null
 
-/**
- * Model families that carry their own weekly cap in Claude's `limits` array.
- * Extend when a new scoped cap shows up there; an absent cap counts as room.
- */
-const SCOPED_CAPS: [RegExp, string][] = [[/fable/i, 'Fable']]
-
 /** The window labels a model spends, in the report's own vocabulary. */
 export function tiersFor(serviceId: ServiceId, model: string | null | undefined): string[] {
   if (serviceId === 'codex') return ['5h', 'week']
   const tiers = ['5h', 'Weekly']
-  if (serviceId === 'claude-code' && model) {
-    for (const [re, label] of SCOPED_CAPS) if (re.test(model)) tiers.push(label)
-  }
+  const cap = scopedCapOf(serviceId, model)
+  if (cap) tiers.push(cap)
   return tiers
 }
 
@@ -44,10 +37,7 @@ export const weeklyLabel = (serviceId: ServiceId): string => (serviceId === 'cod
  * it has one (Fable), else the service's weekly window.
  */
 export function orderLabel(serviceId: ServiceId, model: string | null | undefined): string {
-  if (serviceId === 'claude-code' && model) {
-    for (const [re, label] of SCOPED_CAPS) if (re.test(model)) return label
-  }
-  return weeklyLabel(serviceId)
+  return scopedCapOf(serviceId, model) ?? weeklyLabel(serviceId)
 }
 
 /**
@@ -58,7 +48,7 @@ export function orderLabel(serviceId: ServiceId, model: string | null | undefine
  */
 export function spendFirstLabels(serviceId: ServiceId, model: string | null | undefined): string[] {
   if (serviceId !== 'claude-code' || !model) return []
-  if (SCOPED_CAPS.some(([re]) => re.test(model))) return []
+  if (scopedCapOf(serviceId, model)) return []
   return SCOPED_CAPS.map(([, label]) => label)
 }
 
@@ -124,26 +114,56 @@ export const hasRoom = (report: UsageReport | undefined, tiers: string[], now: n
   blockedWindow(report, tiers, now) === null
 
 /**
- * Soonest-to-reset first in the given window; an account with no such window
- * on file orders by its weekly reset instead (a plan without that cap), then
- * ones with no reset at all, and ones with no windows at all whose usage
- * endpoint is itself limited after those (their numbers are unknown). A
- * usage-poll throttle on an account with windows on file does not move it:
- * that 429 is the usage endpoint, not the model API, and the cached windows
- * still say how much room it has. Ties go to the account that has used more
- * of the window, so the one about to refill anyway gets spent first. A lifted
- * window (reset in the past) counts as absent, not soonest. `spendFirst`
- * windows lead the order: the account with the least room left in them first
- * (a full one ahead of a fresh one; no such window is full room).
+ * Live threads an account carries before new picks sort it behind the rest.
+ * Soft: it orders, never filters, so an all-at-cap set still yields a pick.
  */
-export function orderByReset(label: string | null, reports: UsageReport[], now: number, weekly: string | null = null, spendFirst: string[] = []) {
+export const DEFAULT_THREAD_CAP = 3
+
+/** 5h headroom is compared in 10-point buckets, so the load key can break near-ties. */
+const HEADROOM_BUCKET = 10
+
+export interface OrderOptions {
+  /** The window to order by; an account without it orders by `weekly`. */
+  label: string | null
+  /** The service's weekly window, the fallback clock for an account without `label`. */
+  weekly?: string | null
+  /** Windows to spend down first: the least room left in them leads the order. */
+  spendFirst?: string[]
+  /** Live threads per account (the host's count); an absent account carries none. */
+  load?: Record<string, number>
+  /** Threads per account past which it sorts behind every account under the cap. */
+  cap?: number
+}
+
+/**
+ * The pick order. Keys, first decides:
+ *   1. an account with no windows on file whose usage endpoint is itself
+ *      limited sorts last (its numbers are unknown); a usage-poll throttle on
+ *      an account with windows on file does not move it, since that 429 is the
+ *      usage endpoint, not the model API, and the cached windows still say
+ *      how much room it has;
+ *   2. `spendFirst` windows: the account with the least room left in them
+ *      first (a full one ahead of a fresh one; no such window is full room);
+ *   3. accounts at or past `cap` live threads after those under it;
+ *   4. most 5h headroom (in 10-point buckets; a lifted or absent 5h window is
+ *      full room), so new work spreads over the accounts with room now;
+ *   5. fewest live threads;
+ *   6. soonest reset of the `label` window (an account without it orders by
+ *      its `weekly` reset, a plan without that cap; no reset at all last);
+ *   7. most used of that window, so the one about to refill gets spent first.
+ * A lifted window (reset in the past) counts as absent, not soonest.
+ */
+export function orderByReset(reports: UsageReport[], now: number, { label, weekly = null, spendFirst = [], load = {}, cap = DEFAULT_THREAD_CAP }: OrderOptions) {
   const key = (name: string): number[] => {
     const r = reports.find((x) => x.profileName === name)
     const marked = r?.rateLimit?.until !== undefined && r.rateLimit.until > now
     const limited = marked && r.windows.length === 0 ? 1 : 0
     const w = (label && liveWindow(r, label, now)) || (weekly && liveWindow(r, weekly, now)) || undefined
     const spent = spendFirst.reduce((sum, l) => sum + (liveWindow(r, l, now)?.usedPercent ?? 0), 0)
-    return [limited, -spent, w?.resetsAt ?? 1e14, -(w?.usedPercent ?? 0)]
+    const threads = load[name] ?? 0
+    const headroom = Math.max(0, 100 - (liveWindow(r, '5h', now)?.usedPercent ?? 0))
+    const bucket = Math.floor(headroom / HEADROOM_BUCKET)
+    return [limited, -spent, threads >= cap ? 1 : 0, -bucket, threads, w?.resetsAt ?? 1e14, -(w?.usedPercent ?? 0)]
   }
   return (a: string, b: string): number => {
     const ka = key(a)
@@ -164,16 +184,20 @@ export interface CandidateInput {
   orderBy?: string
   /** Windows to spend down first: the least room left in them leads the order. */
   spendFirst?: string[]
+  /** Live threads per account; the cap and the load key read it. */
+  load?: Record<string, number>
+  /** Threads per account past which it sorts last; `DEFAULT_THREAD_CAP` when absent. */
+  cap?: number
 }
 
-/** Untried, unexpired accounts with room in every required tier, soonest reset first. */
-export function candidates({ serviceId, profiles, reports, required, tried, now, orderBy, spendFirst }: CandidateInput): string[] {
+/** Untried, unexpired accounts with room in every required tier, in pick order (see `orderByReset`). */
+export function candidates({ serviceId, profiles, reports, required, tried, now, orderBy, spendFirst, load, cap }: CandidateInput): string[] {
   const weekly = weeklyLabel(serviceId)
   return profiles
     .map((p) => p.name)
     .filter((name) => !tried.includes(name))
     .filter((name) => hasRoom(reports.find((r) => r.profileName === name), required, now))
-    .sort(orderByReset(orderBy ?? weekly, reports, now, weekly, spendFirst))
+    .sort(orderByReset(reports, now, { label: orderBy ?? weekly, weekly, spendFirst, load, cap }))
 }
 
 export interface PickInput {
@@ -194,6 +218,10 @@ export interface PickInput {
   /** Forced poll of one account; null when nothing fresh could be learned. */
   poll: (name: string) => Promise<UsageReport | null>
   now?: number
+  /** Live threads per account, so a pick lands on the emptiest one. */
+  load?: Record<string, number>
+  /** Per-account thread cap; `DEFAULT_THREAD_CAP` when absent. */
+  cap?: number
 }
 
 const plan = (input: Omit<PickInput, 'poll' | 'window'>): { required: string[]; orderBy: string; spendFirst: string[] } =>

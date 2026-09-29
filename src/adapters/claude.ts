@@ -17,7 +17,6 @@ import { promisify } from 'node:util'
 import type { PlanInfo, UsageWindow } from '../shared/types'
 import { isRunning, launchApp, quitApp } from '../apps'
 import { readPassword, writePassword } from '../keychain'
-import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL } from '../oauth'
 import { readCookies, writeCookies, type PlainCookie } from '../chromium-cookies'
 import {
   cliProcesses,
@@ -27,7 +26,7 @@ import {
   routedThroughAliax,
   terminalOwns
 } from '../procs'
-import type { Adapter, Captured, ExtraPath, UsageResult } from './types'
+import type { Adapter, Captured, ExtraPath, RefreshBlob, UsageResult } from './types'
 import { retryAfterMs } from './types'
 
 const exec = promisify(execFile)
@@ -134,28 +133,6 @@ async function fetchIdentity(
       organizationUuid: org?.uuid,
       organizationName: org?.name
     }
-  }
-}
-
-async function refreshTokens(tokens: Record<string, unknown>): Promise<Record<string, unknown> | null> {
-  if (typeof tokens.refreshToken !== 'string') return null
-  const res = await fetch(CLAUDE_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: tokens.refreshToken,
-      client_id: CLAUDE_CLIENT_ID
-    })
-  }).catch(() => null)
-  if (!res?.ok) return null
-  const data = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number }
-  if (!data.access_token) return null
-  return {
-    ...tokens,
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token ?? tokens.refreshToken,
-    expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000
   }
 }
 
@@ -736,7 +713,7 @@ export const claude: Adapter = {
     return notes
   },
 
-  async usage(blob: string, isActive: boolean, force?: boolean, mayRefresh = true): Promise<UsageResult> {
+  async usage(blob: string, isActive: boolean, force?: boolean, refresh: RefreshBlob | null = null): Promise<UsageResult> {
     // The active account's vault copy is stale within the hour — the CLI renews
     // the Keychain token itself (invariant 16). Poll with the LIVE credential
     // and adopt it back; the caller already proved the live account is this
@@ -786,7 +763,7 @@ export const claude: Adapter = {
         blob = adopted
       }
     }
-    const { keychain, oauthAccount, tokens } = parseTokens(blob)
+    const { keychain, tokens } = parseTokens(blob)
     if (typeof tokens.accessToken !== 'string') {
       // This profile owns the Claude app session but no CLI sign-in, so there
       // is no usage to report — say what it is, not that something failed.
@@ -808,47 +785,51 @@ export const claude: Adapter = {
 
     // A dead token doesn't always answer 401/403 — Anthropic's gateway returns
     // 429 for one too, which read as "rate limited" when it was really expired.
-    // The honest discriminator is the token's own clock: a genuine throttle only
-    // happens on a live token, so a 429 past expiry is a dead token, not a limit.
+    // The token's own clock discriminates, but only for a BARE 429: one that
+    // carries a retry-after is a throttle whatever the clock says (the usage
+    // host throttles per host, and a poll can land on it past expiry).
     const expiredNow = typeof tokens.expiresAt === 'number' && Date.now() > tokens.expiresAt
     let result = await fetchUsageWindows(tokens.accessToken)
-    const authFail = !Array.isArray(result) && (result.status === 401 || result.status === 403)
-    const deadToken = authFail || (!Array.isArray(result) && result.status === 429 && expiredNow)
-    if (deadToken) {
-      // The CLI owns the active account's token and renews it itself; refreshing
-      // here with a superseded refresh token surfaces as "OAuth revoked"
-      // (invariant 16). So the active account only reports — it never refreshes.
-      if (isActive) return { plan, windows: [], expired: true, updatedBlob: adopted }
-      if (!mayRefresh)
-        return { plan, windows: [], note: 'waiting for the gateway owner to refresh', updatedBlob: adopted }
-      const refreshed = await refreshTokens(tokens)
-      if (!refreshed) return { plan, windows: [], expired: true }
-      // Keep the app-session half: dropping it here stripped the claude.ai
-      // cookies from the vault copy on every background refresh.
-      const refreshedBlob = JSON.stringify({
-        keychain: JSON.stringify({ claudeAiOauth: refreshed }),
-        oauthAccount,
-        ...(appSession ? { appSession } : {})
-      })
-      result = await fetchUsageWindows(refreshed.accessToken as string)
-      if (!Array.isArray(result)) {
-        if (result.status === 429)
-          return {
-            plan,
-            windows: [],
-            note: 'usage temporarily unavailable',
-            retryAfterMs: result.retryAfterMs,
-            updatedBlob: refreshedBlob
-          }
-        return { plan, windows: [], note: `usage unavailable (${result.status})`, updatedBlob: refreshedBlob }
-      }
-      return {
-        plan:
-          (await planForToken(refreshed.accessToken as string, force, appSession).catch(
-            () => null
-          )) ?? plan,
-        windows: result,
-        updatedBlob: refreshedBlob
+    const failed = Array.isArray(result) ? null : result
+    const authFail = failed?.status === 401 || failed?.status === 403
+    const bare429 = failed?.status === 429 && failed.retryAfterMs === undefined
+    const deadToken = authFail || (bare429 && expiredNow)
+    const throttledPastExpiry = failed?.status === 429 && !bare429 && expiredNow
+    // The CLI owns the active account's token and renews it itself; refreshing
+    // here with a superseded refresh token surfaces as "OAuth revoked"
+    // (invariant 16). So the active account only reports — it never refreshes.
+    if (deadToken && isActive) return { plan, windows: [], expired: true, updatedBlob: adopted }
+    if (deadToken && !refresh)
+      return { plan, windows: [], note: 'waiting for the gateway owner to refresh', updatedBlob: adopted }
+    if ((deadToken || throttledPastExpiry) && !isActive && refresh) {
+      // The refresh runs under the gateway's lock and re-reads the vault, so a
+      // token someone else already renewed comes back without a network call.
+      const refreshedBlob = await refresh(blob)
+      if (!refreshedBlob) {
+        if (deadToken) return { plan, windows: [], expired: true }
+      } else if (throttledPastExpiry) {
+        // Still throttled: keep the renewed token, report the throttle, never expired.
+        return { plan, windows: [], note: 'usage temporarily unavailable', retryAfterMs: failed?.retryAfterMs, updatedBlob: refreshedBlob }
+      } else {
+        const next = parseTokens(refreshedBlob).tokens
+        if (typeof next.accessToken !== 'string') return { plan, windows: [], expired: true }
+        result = await fetchUsageWindows(next.accessToken)
+        if (!Array.isArray(result)) {
+          if (result.status === 429)
+            return {
+              plan,
+              windows: [],
+              note: 'usage temporarily unavailable',
+              retryAfterMs: result.retryAfterMs,
+              updatedBlob: refreshedBlob
+            }
+          return { plan, windows: [], note: `usage unavailable (${result.status})`, updatedBlob: refreshedBlob }
+        }
+        return {
+          plan: (await planForToken(next.accessToken, force, appSession).catch(() => null)) ?? plan,
+          windows: result,
+          updatedBlob: refreshedBlob
+        }
       }
     }
     if (!Array.isArray(result)) {
