@@ -24,6 +24,10 @@ describe('forward', () => {
     expect(upstreamFor('codex', '/plugins')).toBe('https://chatgpt.com/backend-api')
     expect(upstreamFor('nope', '/')).toBeNull()
     expect(splitPath('/codex/api/codex/ps/mcp')).toEqual({ service: 'codex', rest: '/ps/mcp', scope: null })
+    // Codex 0.156+ workspace routing discovery, addressed relative to a base without /backend-api.
+    expect(splitPath('/codex/api/codex/accounts/check')).toEqual({ service: 'codex', rest: '/wham/accounts/check', scope: null })
+    expect(splitPath('/codex/api/codex/settings/user')).toEqual({ service: 'codex', rest: '/wham/settings/user', scope: null })
+    expect(upstreamFor('codex', '/wham/accounts/check')).toBe('https://chatgpt.com/backend-api')
   })
 
   it('swaps Authorization for the pinned account and streams the answer', async () => {

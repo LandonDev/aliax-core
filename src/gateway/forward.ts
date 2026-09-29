@@ -364,10 +364,16 @@ export function splitPath(url: string): { service: string; rest: string; scope: 
     scope = parseScope(rest.slice(1, end === -1 ? undefined : end))
     if (scope) rest = end === -1 ? '' : rest.slice(end)
   }
-  // Codex builds its connector-runtime URL as <base>/api/codex/ps/mcp when
-  // the base (us) has no /backend-api marker — strip the doubled prefix so
-  // /ps/* resolves against the real codex backend.
-  if (service === 'codex' && rest.startsWith('/api/codex/')) rest = rest.slice('/api/codex'.length)
+  // When the base (us) carries no /backend-api marker, Codex addresses two
+  // families under <base>/api/codex/: the connector runtime (/api/codex/ps/*,
+  // live at /backend-api/ps/*) and the account endpoints Codex 0.156+ reads
+  // before every turn (/api/codex/accounts/check, /api/codex/settings/user, …,
+  // live at /backend-api/wham/*). Both confirmed against chatgpt.com; the
+  // /api/codex root itself answers 403 there.
+  if (service === 'codex' && rest.startsWith('/api/codex/')) {
+    const tail = rest.slice('/api/codex'.length)
+    rest = tail.startsWith('/ps/') ? tail : `/wham${tail}`
+  }
   return { service, rest, scope }
 }
 
