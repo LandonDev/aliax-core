@@ -17,6 +17,12 @@ export type SecretsMode =
    * the same bytes Aliax's safeStorage writes, so both apps read one vault.
    */
   | { mode: 'chromiumKey'; keychainItem: string }
+  /**
+   * No Keychain at all (a Linux agent box): a random password in a file with
+   * mode 0600, default `<dataDir>/vault.key`, stands in for the Keychain item
+   * and feeds the same derivation, so the blobs stay the same "v10" bytes.
+   */
+  | { mode: 'fileKey'; path?: string }
 
 export interface UsageSample {
   service: ServiceId

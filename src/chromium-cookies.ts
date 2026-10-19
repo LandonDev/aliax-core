@@ -58,6 +58,7 @@ export async function readCookies(
   keychainService: string,
   domainContains: string
 ): Promise<PlainCookie[]> {
+  if (process.platform !== 'darwin') return []
   const key = await storageKey(keychainService)
   const db = new DatabaseSync(cookiesDbPath, { readOnly: true })
   try {
@@ -113,6 +114,7 @@ export async function writeCookies(
   cookies: PlainCookie[],
   clearDomainsContaining: string[]
 ): Promise<number> {
+  if (process.platform !== 'darwin') return 0
   const key = await storageKey(keychainService)
   const db = new DatabaseSync(cookiesDbPath)
   try {

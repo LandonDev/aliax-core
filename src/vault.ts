@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process'
 import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
-import { config, dataDir } from './config'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { config, dataDir, type SecretsMode } from './config'
 import { writeAtomic } from './fs'
 import { randomAccountColor } from './shared/colors'
 import type { ServiceId } from './shared/types'
@@ -133,6 +133,7 @@ export function vaultLocked(): boolean {
 /** Drop the cached key so the next read asks the Keychain again. */
 export function resetKeyCache(): void {
   chromiumKeyCache = null
+  fileKeyCache = null
 }
 
 function chromiumKey(item: string): Buffer | null {
@@ -148,20 +149,66 @@ export function useFixedChromiumKey(item: string, key: Buffer): void {
   chromiumKeyCache = { item, key }
 }
 
+// ---------------------------------------------------------------------------
+// fileKey: the Keychain item's stand-in on a machine with no Keychain (a Linux
+// agent box). A random password sits in a file with mode 0600 (default
+// <dataDir>/vault.key) and feeds the very same PBKDF2 derivation, so the blobs
+// are the same "v10" bytes every other mode writes: a vault sealed this way
+// reads back under chromiumKey given the same password, and the macOS vault
+// is untouched because no macOS host selects this mode. Chosen over Electron's
+// safeStorage, which on a headless box has no keyring to lean on and falls
+// back to a fixed built-in key anyway, with none of this clarity.
+
+let fileKeyCache: { path: string; key: Buffer } | null = null
+
+export const defaultVaultKeyPath = (): string => join(dataDir(), 'vault.key')
+
+/** The key file's password, created with an exclusive open so two processes racing to create it agree on one. */
+function fileKeyPassword(path: string): string {
+  for (;;) {
+    let existing: string | null = null
+    try {
+      existing = readFileSync(path, 'utf8').trim()
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+    if (existing) return existing
+    if (existing === '') throw new Error(`vault key file ${path} is empty`)
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+    try {
+      writeFileSync(path, `${randomBytes(32).toString('hex')}\n`, { flag: 'wx', mode: 0o600 })
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+      // another process made it first; the next read picks theirs up
+    }
+  }
+}
+
+function fileKey(path: string): Buffer {
+  if (fileKeyCache?.path === path) return fileKeyCache.key
+  const key = deriveChromiumKey(fileKeyPassword(path))
+  fileKeyCache = { path, key }
+  return key
+}
+
+/** The AES key behind the v10 blobs; throws when the Keychain holds it back. */
+function sealingKey(s: Exclude<SecretsMode, { mode: 'safeStorage' }>): Buffer {
+  if (s.mode === 'fileKey') return fileKey(s.path ?? defaultVaultKeyPath())
+  const key = chromiumKey(s.keychainItem)
+  if (!key) throw new Error(`vault locked: Keychain item "${s.keychainItem}" unavailable`)
+  return key
+}
+
 function encrypt(plain: string): Buffer {
   const s = config().secrets
   if (s.mode === 'safeStorage') return s.encrypt(plain)
-  const key = chromiumKey(s.keychainItem)
-  if (!key) throw new Error(`vault locked: Keychain item "${s.keychainItem}" unavailable`)
-  return chromiumEncrypt(key, plain)
+  return chromiumEncrypt(sealingKey(s), plain)
 }
 
 function decrypt(blob: Buffer): string {
   const s = config().secrets
   if (s.mode === 'safeStorage') return s.decrypt(blob)
-  const key = chromiumKey(s.keychainItem)
-  if (!key) throw new Error(`vault locked: Keychain item "${s.keychainItem}" unavailable`)
-  return chromiumDecrypt(key, blob)
+  return chromiumDecrypt(sealingKey(s), blob)
 }
 
 export function saveSecret(serviceId: ServiceId, name: string, blob: string): void {

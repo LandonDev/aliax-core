@@ -1,13 +1,16 @@
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import { credentials } from './credentials'
 
-const exec = promisify(execFile)
-
+/**
+ * The adapters' original two calls, now served by whichever credential
+ * backend the platform selects (see credentials.ts). `readPassword` still
+ * throws when nothing is stored, as the Keychain version did.
+ */
 export async function readPassword(service: string): Promise<string> {
-  const { stdout } = await exec('security', ['find-generic-password', '-s', service, '-w'])
-  return stdout.replace(/\n$/, '')
+  const value = await credentials().read(service)
+  if (value === null) throw new Error(`no "${service}" credentials stored: not signed in`)
+  return value
 }
 
 export async function writePassword(service: string, account: string, value: string): Promise<void> {
-  await exec('security', ['add-generic-password', '-U', '-s', service, '-a', account, '-w', value])
+  await credentials().write(service, account, value)
 }

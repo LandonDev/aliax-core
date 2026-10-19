@@ -96,7 +96,7 @@ export async function cliProcesses(name: string): Promise<CliProcess[]> {
     try {
       const { stdout } = await exec('ps', ['-o', 'tty=', '-p', String(pid)])
       tty = stdout.trim()
-      if (tty === '??' || !tty) continue
+      if (tty === '??' || tty === '?' || !tty) continue
     } catch {
       continue
     }
@@ -133,7 +133,7 @@ export async function headlessCliProcesses(name: string): Promise<number[]> {
     try {
       const { stdout } = await exec('ps', ['-o', 'tty=', '-p', String(pid)])
       const tty = stdout.trim()
-      if (tty === '??' || !tty) out.push(pid)
+      if (tty === '??' || tty === '?' || !tty) out.push(pid)
     } catch {
       // gone already
     }
