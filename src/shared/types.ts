@@ -13,6 +13,14 @@ export interface ProfileView {
   activeOn?: string[]
   /** Another saved profile holds credentials for this same account. */
   duplicate?: boolean
+  /** The environment that refreshes this account; absent means this machine, or nothing for a static token. */
+  owner?: string
+  /** A long-lived bearer (`claude setup-token`): nothing refreshes it, it lapses at `expiresAt`. */
+  static?: boolean
+  /** When the stored access token lapses, when the credentials say. */
+  expiresAt?: number
+  /** When a copy was last exchanged with another environment. */
+  syncedAt?: number
 }
 
 export interface SwitchTarget {

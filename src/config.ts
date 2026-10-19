@@ -33,11 +33,29 @@ export interface UsageSample {
   periodMs?: number
 }
 
+/**
+ * Where a vault write came from: `local` is this machine's own doing (a
+ * refresh, a capture, a sign-in), `sync` a copy another environment sent or
+ * a rewrite made because of one. A host that syncs accounts forwards only
+ * `local` saves, so a push never echoes back to its sender.
+ */
+export type SaveOrigin = 'local' | 'sync'
+
 export interface Hooks {
   onUsageSample?: (sample: UsageSample) => void
   onAppEvent?: (kind: string, service?: ServiceId, account?: string, detail?: string) => void
   /** The pinned account changed (a switch, later a failover); hosts redraw. Not fired for cache writes: a host that answers it with a poll would loop. */
   onAccountsChanged?: () => void
+  /** A secret landed in the vault (see SaveOrigin). Fired for every save, so hosts debounce. */
+  onSecretSaved?: (serviceId: ServiceId, name: string, origin: SaveOrigin) => void
+  /**
+   * A copy this environment does not own is near the end of its access
+   * token: ask `owner` (an environment id) for a fresh one. The host fetches
+   * the owner's access-only copy, applies it (sync.ts applyTransfer) and
+   * answers with the blob now in the vault, or null when the owner is
+   * unreachable. Never called for an account this environment owns.
+   */
+  askOwner?: (serviceId: ServiceId, name: string, owner: string) => Promise<string | null>
 }
 
 /** `owner` runs the gateway and refreshes stored tokens; `standby` only reads. */
@@ -54,6 +72,14 @@ export interface CoreConfig {
   appName?: string
   hooks?: Hooks
   role?: () => Role
+  /**
+   * This host's identity among the environments that share accounts
+   * (temp-code's `env_…` id). A profile's `owner` is compared to it: equal
+   * means this host refreshes the grant, anything else means this host holds
+   * an access-only copy. Absent (Aliax), every profile with an owner on file
+   * belongs to someone else.
+   */
+  environmentId?: string
 }
 
 let current: CoreConfig | null = null
@@ -71,3 +97,4 @@ export const dataDir = (): string => config().dataDir
 export const fetch: Fetch = (input, init) => config().fetch(input, init)
 export const hooks = (): Hooks => config().hooks ?? {}
 export const role = (): Role => config().role?.() ?? 'owner'
+export const environmentId = (): string | null => config().environmentId ?? null

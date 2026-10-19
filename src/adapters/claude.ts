@@ -28,6 +28,7 @@ import {
 } from '../procs'
 import type { Adapter, Captured, ExtraPath, RefreshBlob, UsageResult } from './types'
 import { retryAfterMs } from './types'
+import { isStaticBlob } from '../sync'
 
 const exec = promisify(execFile)
 
@@ -452,6 +453,19 @@ export function parseClaudeUsage(body: Record<string, unknown> & { limits?: ApiL
   return windows
 }
 
+/**
+ * Usage for a static bearer (claude setup-token): inference-only, so the
+ * usage endpoint may refuse it, and that is not a sign-out. Nothing renews
+ * it; it is dead only once its own clock says so.
+ */
+async function staticUsage(accessToken: string, expiresAt: unknown): Promise<UsageResult> {
+  if (typeof expiresAt === 'number' && Date.now() > expiresAt) return { windows: [], expired: true }
+  const result = await fetchUsageWindows(accessToken)
+  if (Array.isArray(result)) return { windows: result }
+  if (result.status === 429) return { windows: [], note: 'usage temporarily unavailable', retryAfterMs: result.retryAfterMs }
+  return { windows: [], note: 'one-year token: usage is not reported' }
+}
+
 export const claude: Adapter = {
   id: 'claude-code',
   name: 'Claude Code',
@@ -775,6 +789,8 @@ export const claude: Adapter = {
             : 'no token saved'
       }
     }
+
+    if (isStaticBlob(blob)) return staticUsage(tokens.accessToken, tokens.expiresAt)
 
     // Plan is resolved once, up front, and attached to EVERY return: it depends
     // only on the token, so an account whose usage call fails should still show

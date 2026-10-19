@@ -11,7 +11,8 @@ import { limitLabel } from './gateway/failover'
 import type { Limit } from './gateway/limits'
 import { writeAtomic } from './fs'
 import { enabledTargets } from './settings'
-import { refreshClaude } from './refresh'
+import { refreshFor } from './refresh'
+import { accessExpiry, hasRefresh, ownsProfile } from './sync'
 import * as vault from './vault'
 
 export const extra =
@@ -109,7 +110,9 @@ function vaultFresherThan(a: Adapter, name: string, blob: string): boolean {
 export async function recaptureLive(a: Adapter): Promise<void> {
   const name = await activeProfileName(a)
   const existing = vault.profiles(a.id).find((p) => p.name === name)
-  if (existing) {
+  // A copy another environment owns comes only from that owner, and a static
+  // token never changes: the live store teaches neither anything.
+  if (existing && ownsProfile(existing)) {
     const captured = await a.capture(extra(a.id, existing.name))
     if (captured.accountId === existing.accountId && captured.blob !== undefined) {
       saveSecretUnlessOlder(a, existing.name, captured.blob)
@@ -145,8 +148,15 @@ export function saveCaptured(serviceId: ServiceId, captured: Captured): string |
 
   const name = match?.name ?? captured.email ?? `account-${existing.length + 1}`
 
+  // A grant of our own (a refresh token) makes this machine the owner again,
+  // and replaces a static token or a copy owned elsewhere outright: the user
+  // signed in on purpose. Without one, a copy the owner elsewhere keeps fresh
+  // and a static token learn nothing from what was captured.
+  const grant = captured.blob !== undefined && hasRefresh(serviceId, captured.blob)
   if (captured.blob !== undefined) {
-    saveSecretUnlessOlder(adapter(serviceId), name, captured.blob)
+    const owned = !match || ownsProfile(match)
+    if (owned && !match?.static) saveSecretUnlessOlder(adapter(serviceId), name, captured.blob)
+    else if (grant) vault.saveSecret(serviceId, name, captured.blob)
   } else if (captured.appSession !== undefined) {
     // App-session-only save: merge into any existing credentials for this account
     // rather than replacing them, so a profile accumulates both halves.
@@ -162,7 +172,8 @@ export function saveCaptured(serviceId: ServiceId, captured: Captured): string |
       captured.blob !== undefined ? captured.accountId : (match?.accountId ?? captured.accountId),
     hasAppSession: captured.appSession !== undefined ? true : match?.hasAppSession,
     email: captured.email ?? match?.email,
-    createdAt: match?.createdAt ?? Date.now()
+    createdAt: match?.createdAt ?? Date.now(),
+    ...(grant ? { static: false, owner: undefined, syncedAt: undefined } : {})
   })
   return name
 }
@@ -250,6 +261,16 @@ export async function repairProfiles(serviceId: ServiceId): Promise<void> {
   }
 }
 
+/** When a stored copy's access token lapses, for the profile list; unknown when unreadable. */
+function storedExpiry(serviceId: ServiceId, name: string): number | undefined {
+  try {
+    const blob = vault.readSecret(serviceId, name)
+    return blob ? (accessExpiry(serviceId, blob) ?? undefined) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function listServices(): Promise<ServiceView[]> {
   return Promise.all(
     adapters.map(async (a) => {
@@ -306,7 +327,11 @@ export async function listServices(): Promise<ServiceView[]> {
             : p.name === active
               ? ['Active']
               : [],
-          duplicate: (counts.get(p.accountId) ?? 0) > 1
+          duplicate: (counts.get(p.accountId) ?? 0) > 1,
+          owner: p.owner,
+          static: p.static,
+          syncedAt: p.syncedAt,
+          expiresAt: storedExpiry(a.id, p.name)
         }))
       }
     })
@@ -610,8 +635,9 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
   if (!blob) return { profileName: p.name, windows: [], note: 'app session only. Add account for usage' }
   try {
     // Only the gateway owner rotates a grant, and only under the same lock
-    // the gateway's own refresh takes (invariant 12).
-    const refresh = role() === 'owner' ? (b: string) => refreshClaude(p.name, b) : null
+    // the gateway's own refresh takes (invariant 12); a copy owned by another
+    // environment asks that owner instead (refresh.ts).
+    const refresh = refreshFor(serviceId, p.name)
     const result = await a.usage(blob, p.name === active, force, refresh)
     // Never backwards: the gateway may have rotated the token since this poll
     // read its copy, and a poll's snapshot must not undo that.

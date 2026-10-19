@@ -134,7 +134,7 @@ function planFromAuth(authJson: string): PlanInfo | undefined {
 const REFRESH_MARGIN_MS = 48 * 3_600_000
 
 /** Milliseconds until the stored access token expires; null when unreadable. */
-function accessMsLeft(authJson: string): number | null {
+export function accessMsLeft(authJson: string): number | null {
   try {
     const token = (JSON.parse(authJson) as { tokens?: { access_token?: string } }).tokens
       ?.access_token
@@ -147,7 +147,8 @@ function accessMsLeft(authJson: string): number | null {
   }
 }
 
-async function refreshAuth(authJson: string): Promise<string | null> {
+/** One POST to the token endpoint with the blob's own refresh token; the caller (refresh.ts) holds the lock and owns the save. */
+export async function refreshAuth(authJson: string): Promise<string | null> {
   const auth = JSON.parse(authJson)
   const refreshToken = auth.tokens?.refresh_token
   if (typeof refreshToken !== 'string') return null
@@ -283,8 +284,6 @@ export const codex: Adapter = {
   },
 
   async usage(blob: string, isActive: boolean, _force?: boolean, refresh: RefreshBlob | null = null): Promise<UsageResult> {
-    // Codex refreshes in place for now; the callback only says whether we may.
-    const mayRefresh = refresh !== null
     // Resolved up front and attached to every return: the plan lives in the
     // stored token itself, so it should show even when the usage call fails.
     const plan = planFromAuth(blob)
@@ -294,9 +293,11 @@ export const codex: Adapter = {
       // Saved copies renew themselves before the 10-day access token runs out,
       // so an untouched account stays signed in indefinitely. Never the active
       // account: the CLI owns that file, and a second refresher racing the same
-      // rotating token family is exactly what gets a grant revoked.
-      if (!isActive && mayRefresh && msLeft !== null && msLeft < REFRESH_MARGIN_MS) {
-        const updatedBlob = await refreshAuth(blob)
+      // rotating token family is exactly what gets a grant revoked. The
+      // callback (refresh.ts) holds the per-profile lock and asks the owner
+      // instead of the endpoint for a copy another environment owns.
+      if (!isActive && refresh && msLeft !== null && msLeft < REFRESH_MARGIN_MS) {
+        const updatedBlob = await refresh(blob)
         if (updatedBlob) {
           const early = await fetchApiUsage(JSON.parse(updatedBlob))
           if (early !== null)
@@ -312,8 +313,8 @@ export const codex: Adapter = {
         // which reads as theft upstream and kills any surviving session too.
         if (msLeft !== null && msLeft > 0)
           return { plan, windows: [], note: 'login revoked. Add the account again' }
-        if (!mayRefresh) return { plan, windows: [], note: 'waiting for the gateway owner to refresh' }
-        const updatedBlob = await refreshAuth(blob)
+        if (!refresh) return { plan, windows: [], note: 'waiting for the gateway owner to refresh' }
+        const updatedBlob = await refresh(blob)
         if (!updatedBlob)
           return { plan, windows: [], note: 'session expired. Add the account again' }
         result = await fetchApiUsage(JSON.parse(updatedBlob))

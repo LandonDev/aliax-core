@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { config, dataDir, type SecretsMode } from './config'
+import { config, dataDir, hooks, type SaveOrigin, type SecretsMode } from './config'
 import { writeAtomic } from './fs'
 import { randomAccountColor } from './shared/colors'
 import type { ServiceId } from './shared/types'
@@ -17,6 +17,18 @@ export interface StoredProfile {
   hasAppSession?: boolean
   createdAt: number
   lastActivatedAt?: number
+  /**
+   * The environment that refreshes this account's grant (temp-code's `env_…`
+   * id). Absent: this machine, as every profile was before ownership existed.
+   * Any other host holds an access-only copy (no refresh token) that follows
+   * the owner's pushes. Meaningless for a static profile, which nothing
+   * refreshes.
+   */
+  owner?: string
+  /** A long-lived bearer (`claude setup-token`): no refresh token, nothing to refresh; it lapses at its expiry. */
+  static?: boolean
+  /** When a copy was last exchanged with another environment. */
+  syncedAt?: number
 }
 
 type Meta = Partial<Record<ServiceId, StoredProfile[]>>
@@ -211,8 +223,10 @@ function decrypt(blob: Buffer): string {
   return chromiumDecrypt(sealingKey(s), blob)
 }
 
-export function saveSecret(serviceId: ServiceId, name: string, blob: string): void {
+/** Seal one profile's credentials. `origin` says whether this machine made the change (see SaveOrigin). */
+export function saveSecret(serviceId: ServiceId, name: string, blob: string, origin: SaveOrigin = 'local'): void {
   writeAtomic(`${fileStem(serviceId, name)}.bin`, encrypt(blob))
+  hooks().onSecretSaved?.(serviceId, name, origin)
 }
 
 /**

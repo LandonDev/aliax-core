@@ -4,14 +4,14 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { accountIdForToken, liveKeychain } from '../adapters/claude'
 import { fetch, role } from '../config'
-import { OPENAI_CLIENT_ID, OPENAI_TOKEN_URL } from '../oauth'
-import { EXPIRY_MARGIN_MS, once, refreshClaude } from '../refresh'
+import { EXPIRY_MARGIN_MS, refreshClaude, refreshCodex } from '../refresh'
 import { pinProfile, pinnedProfile } from '../settings'
 import { hooks } from '../config'
 import { cachedReport, observeLimit } from '../accounts'
 import { blockedWindow, serviceIdOf, tiersFor } from './failover'
 import { classify429, type Limit } from './limits'
 import type { ServiceId } from '../shared/types'
+import { ownsProfile } from '../sync'
 import * as vault from '../vault'
 
 /**
@@ -93,57 +93,22 @@ async function refreshClaudeIfNeeded(name: string, blob: string): Promise<void> 
 
 /** Same for Codex, whose access token lasts ten days but still expires. */
 async function refreshCodexIfNeeded(name: string, raw: string): Promise<void> {
-  let auth: { tokens?: { access_token?: string; refresh_token?: string } }
+  let token: unknown
   try {
-    auth = JSON.parse(raw)
+    token = (JSON.parse(raw) as { tokens?: { access_token?: unknown } }).tokens?.access_token
   } catch {
     return
   }
-  const token = auth.tokens?.access_token
-  const refreshToken = auth.tokens?.refresh_token
-  if (!token || !refreshToken) return
+  if (typeof token !== 'string') return
   let exp = 0
   try {
-    const payload = token.split('.')[1]
-    exp = (JSON.parse(Buffer.from(payload, 'base64url').toString()) as { exp?: number }).exp ?? 0
+    exp = (JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()) as { exp?: number }).exp ?? 0
   } catch {
     return
   }
   if (exp * 1000 - Date.now() > EXPIRY_MARGIN_MS) return
-
-  await once('codex', name, async () => {
-    const res = await fetch(OPENAI_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: OPENAI_CLIENT_ID,
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        scope: 'openid profile email'
-      })
-    }).catch(() => null)
-    if (!res?.ok) return
-    const data = (await res.json()) as {
-      access_token?: string
-      refresh_token?: string
-      id_token?: string
-    }
-    if (!data.access_token) return
-    vault.saveSecret(
-      'codex',
-      name,
-      JSON.stringify({
-        ...auth,
-        tokens: {
-          ...auth.tokens,
-          access_token: data.access_token,
-          refresh_token: data.refresh_token ?? refreshToken,
-          id_token: data.id_token ?? (auth.tokens as { id_token?: string })?.id_token
-        },
-        last_refresh: new Date().toISOString()
-      })
-    )
-  })
+  // Under the shared lock, with the vault's own refresh token; a copy owned elsewhere asks its owner.
+  await refreshCodex(name, raw)
 }
 
 const bearer = (keychain: string): Credential | null => {
@@ -203,7 +168,8 @@ async function claudeCredential(account: string | null): Promise<Credential | nu
       } catch {
         parsed = {}
       }
-      if (role() === 'owner' && expiryOf(live) > expiryOf((parsed.keychain as string) ?? null)) {
+      // Only a grant this environment owns follows the CLI's copy; a copy owned elsewhere comes from its owner.
+      if (role() === 'owner' && ownsProfile(profile) && expiryOf(live) > expiryOf((parsed.keychain as string) ?? null)) {
         vault.saveSecret('claude-code', name, JSON.stringify({ ...parsed, keychain: live }))
       }
       return bearer(live)
