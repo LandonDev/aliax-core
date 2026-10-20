@@ -20,6 +20,12 @@ export type RefreshBlob = (blob: string) => Promise<string | null>
 export interface UsageResult {
   windows: UsageWindow[]
   note?: string
+  /**
+   * The note is the account's standing state, not a passing hiccup (a
+   * one-year token the usage endpoint refuses by scope): it replaces any
+   * numbers cached from an earlier credential instead of being kept behind them.
+   */
+  settled?: boolean
   /** Short supplemental fact. */
   extra?: string
   /** Banked limit resets the account can spend (Codex). */

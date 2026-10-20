@@ -136,6 +136,29 @@ describe('accounts.usage cache gates', () => {
   })
 })
 
+describe('a one-year token the usage endpoint refuses', () => {
+  it('replaces the numbers cached from the credential before it with its note, instead of keeping them behind it', async () => {
+    ;({ cleanup } = tempCore())
+    vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })
+    vault.saveSecret('codex', 'p', '{}')
+    const usage = vi
+      .fn<Adapter['usage']>()
+      .mockResolvedValueOnce({ windows: [{ label: '5h', usedPercent: 40 }], plan: { name: 'Max 5x' } })
+      .mockResolvedValueOnce({ windows: [], note: 'session expired mid-poll' })
+      .mockResolvedValueOnce({ windows: [], settled: true, note: 'one-year token without user:profile: usage is not reported' })
+    stubCodex(usage)
+    await accounts.usage('codex', true)
+    // A passing hiccup keeps the last good numbers on the row.
+    const [kept] = await accounts.usage('codex', true)
+    expect(kept.windows).toEqual([{ label: '5h', usedPercent: 40 }])
+    expect(kept.note).toBeUndefined()
+    // A standing refusal does not: the row says what the token is, and keeps only the plan line.
+    const [settled] = await accounts.usage('codex', true)
+    expect(settled).toMatchObject({ windows: [], note: 'one-year token without user:profile: usage is not reported', plan: { name: 'Max 5x' } })
+    expect(accounts.cachedReport('codex', 'p')?.windows).toEqual([])
+  })
+})
+
 describe('saveSecretUnlessOlder', () => {
   it('keeps the fresher stored copy', () => {
     ;({ cleanup } = tempCore())

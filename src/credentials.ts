@@ -102,7 +102,14 @@ export function fileBackend(opts: FileBackendOptions = {}): CredentialBackend {
   }
 }
 
-export function credentialBackendFor(platform: NodeJS.Platform = process.platform): CredentialBackend {
+/**
+ * The platform's own store, except that `ALIAX_CREDENTIAL_BACKEND=file`
+ * makes a macOS process use the credentials file too: an isolated
+ * instance under test points CLAUDE_CONFIG_DIR into its own data and never
+ * reads or writes the user's Keychain item.
+ */
+export function credentialBackendFor(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): CredentialBackend {
+  if (env.ALIAX_CREDENTIAL_BACKEND === 'file') return fileBackend()
   return platform === 'darwin' ? keychainBackend() : fileBackend()
 }
 

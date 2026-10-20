@@ -706,7 +706,10 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
     }
     // A non-rate-limit hiccup (session expired mid-poll, etc.): keep the last
     // good numbers rather than blanking the row, and clear any stale limit.
-    if (report.windows.length === 0 && report.note && cached?.report.windows.length) {
+    // Not for a standing state the adapter vouches for (a one-year token the
+    // endpoint refuses by scope): numbers from the credential before it
+    // would otherwise outlive it on the row.
+    if (report.windows.length === 0 && report.note && cached?.report.windows.length && !result.settled) {
       const kept: UsageReport = { ...cached.report, rateLimit: undefined }
       cache().set(key, { at: now, report: kept })
       persistCache()

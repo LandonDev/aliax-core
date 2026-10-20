@@ -3,6 +3,7 @@ import { decodeJwtPayload } from './adapters/types'
 import { environmentId } from './config'
 import { acquire } from './lock'
 import type { ServiceId } from './shared/types'
+import type { PlainCookie } from './chromium-cookies'
 import * as vault from './vault'
 import type { StoredProfile } from './vault'
 
@@ -434,6 +435,8 @@ export interface StaticClaudeToken {
   scopes?: string[]
   organizationUuid?: string
   organizationName?: string
+  /** A fresher claude.ai session the mint ran in; absent keeps the row's own. */
+  appSession?: PlainCookie[] | null
 }
 
 /**
@@ -469,7 +472,7 @@ export function saveStaticClaude(input: StaticClaudeToken): string {
   vault.saveSecret(
     'claude-code',
     name,
-    JSON.stringify({ keychain, oauthAccount, appSession: prior?.appSession ?? null, tokenKind: 'static' })
+    JSON.stringify({ keychain, oauthAccount, appSession: input.appSession ?? prior?.appSession ?? null, tokenKind: 'static' })
   )
   vault.upsertProfile('claude-code', {
     ...existing,

@@ -29,6 +29,7 @@ import {
 import type { Adapter, Captured, ExtraPath, RefreshBlob, UsageResult } from './types'
 import { retryAfterMs } from './types'
 import { isStaticBlob } from '../sync'
+import * as vault from '../vault'
 
 const exec = promisify(execFile)
 
@@ -42,7 +43,8 @@ const DESKTOP_SESSION = ['Cookies', 'Cookies-journal', 'Local Storage', 'Session
 const DESKTOP_ARCHIVE = 'claude-desktop.tar.gz'
 const OAUTH_HEADERS = { 'anthropic-beta': 'oauth-2025-04-20', 'Content-Type': 'application/json' }
 
-const claudeJsonPath = (): string => join(homedir(), '.claude.json')
+/** The CLI's own metadata file: inside CLAUDE_CONFIG_DIR when that is set, as the CLI keeps it. */
+const claudeJsonPath = (): string => join(process.env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json')
 
 function readOauthAccount(): Record<string, unknown> | null {
   try {
@@ -310,6 +312,14 @@ async function liveCliIdentity(): Promise<{ accountId: string; email?: string } 
         liveIdCache = { key, accountId: identity.uuid, email: identity.email }
         return { accountId: identity.uuid, email: identity.email }
       }
+      // A one-year token minted with `user:inference` alone cannot ask the
+      // profile endpoint who it is, but the vault knows: the live token IS
+      // one of the stored static tokens, byte for byte, so that row names it.
+      const stored = storedStaticOwner(tokens.accessToken)
+      if (stored) {
+        liveIdCache = { key, accountId: stored.accountId, email: stored.email }
+        return stored
+      }
     }
   } catch {
     // keychain unreadable or offline; fall back to the metadata file
@@ -320,6 +330,20 @@ async function liveCliIdentity(): Promise<{ accountId: string; email?: string } 
     accountId: account.accountUuid,
     email: typeof account.emailAddress === 'string' ? account.emailAddress : undefined
   }
+}
+
+/** The static profile whose stored token is exactly `accessToken`, if any. */
+function storedStaticOwner(accessToken: string): { accountId: string; email?: string } | null {
+  for (const p of vault.profiles('claude-code')) {
+    if (!p.static) continue
+    try {
+      const blob = vault.readSecret('claude-code', p.name)
+      if (blob && parseTokens(blob).tokens.accessToken === accessToken) return { accountId: p.accountId, email: p.email }
+    } catch {
+      // an unreadable row names nothing
+    }
+  }
+  return null
 }
 
 const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.]{2,}/g
@@ -454,16 +478,28 @@ export function parseClaudeUsage(body: Record<string, unknown> & { limits?: ApiL
 }
 
 /**
- * Usage for a static bearer (claude setup-token): inference-only, so the
- * usage endpoint may refuse it, and that is not a sign-out. Nothing renews
- * it; it is dead only once its own clock says so.
+ * Usage for a static bearer (a one-year token). With `user:profile` in its
+ * scope the usage endpoint answers and the plan line comes along; a token
+ * minted with `user:inference` alone is refused there, which is not a
+ * sign-out: the row says so and nothing is retried against it. Nothing
+ * renews the token from here; it is dead only once its own clock says so.
  */
-async function staticUsage(accessToken: string, expiresAt: unknown): Promise<UsageResult> {
+async function staticUsage(
+  accessToken: string,
+  expiresAt: unknown,
+  scopes: unknown,
+  force?: boolean,
+  appSession?: PlainCookie[] | null
+): Promise<UsageResult> {
   if (typeof expiresAt === 'number' && Date.now() > expiresAt) return { windows: [], expired: true }
   const result = await fetchUsageWindows(accessToken)
-  if (Array.isArray(result)) return { windows: result }
+  if (Array.isArray(result)) {
+    const plan = (await planForToken(accessToken, force, appSession).catch(() => null)) ?? undefined
+    return { plan, windows: result }
+  }
   if (result.status === 429) return { windows: [], note: 'usage temporarily unavailable', retryAfterMs: result.retryAfterMs }
-  return { windows: [], note: 'one-year token: usage is not reported' }
+  const inferenceOnly = Array.isArray(scopes) && scopes.length > 0 && !scopes.includes('user:profile')
+  return { windows: [], settled: true, note: inferenceOnly ? 'one-year token without user:profile: usage is not reported' : `one-year token: usage refused (${result.status})` }
 }
 
 export const claude: Adapter = {
@@ -790,7 +826,7 @@ export const claude: Adapter = {
       }
     }
 
-    if (isStaticBlob(blob)) return staticUsage(tokens.accessToken, tokens.expiresAt)
+    if (isStaticBlob(blob)) return staticUsage(tokens.accessToken, tokens.expiresAt, tokens.scopes, force, appSession)
 
     // Plan is resolved once, up front, and attached to EVERY return: it depends
     // only on the token, so an account whose usage call fails should still show
