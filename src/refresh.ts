@@ -3,7 +3,8 @@ import type { RefreshBlob } from './adapters/types'
 import { fetch, hooks, role } from './config'
 import { CLAUDE_CLIENT_ID, CLAUDE_TOKEN_URL } from './oauth'
 import type { ServiceId } from './shared/types'
-import { accessExpiry, isStaticBlob, ownsProfile, profileOf } from './sync'
+import { withLock } from './lock'
+import { accessExpiry, isStaticBlob, ownsProfile, profileOf, stripRefresh } from './sync'
 import * as vault from './vault'
 
 /** Refresh a minute before expiry, so a long turn cannot start on a dead token. */
@@ -14,8 +15,10 @@ export const EXPIRY_MARGIN_MS = 60_000
  * Rotating refresh tokens invalidate their predecessor, so two concurrent
  * refreshes of the same grant would present the same token twice and get it
  * revoked (invariant 12). A second caller joins the first's promise and gets
- * its result. Different profiles hold different grants and may refresh side
- * by side.
+ * its result. The work runs under the profile's lock (lock.ts), the same one
+ * a handoff holds across its round trip, so a refresh and a change of owner
+ * never interleave. Different profiles hold different grants and may refresh
+ * side by side.
  */
 const refreshing = new Map<string, Promise<unknown>>()
 
@@ -23,9 +26,25 @@ export function once<T>(serviceId: ServiceId, name: string, work: () => Promise<
   const key = `${serviceId}:${name}`
   const existing = refreshing.get(key)
   if (existing) return existing as Promise<T>
-  const p = work().finally(() => refreshing.delete(key))
+  const p = withLock(serviceId, name, work).finally(() => refreshing.delete(key))
   refreshing.set(key, p)
   return p
+}
+
+/**
+ * The save after a token endpoint answered. The lock keeps a handoff from
+ * running meanwhile, but ownership is read again all the same: a refresh
+ * token is never written into a vault this host no longer refreshes for
+ * (the former owner after a handoff holds an access-only copy, and a
+ * provisional copy of an incoming grant is left as it is). In that case
+ * the fresh access token serves the caller once and the vault stays as the
+ * sync left it.
+ */
+function saveRefreshed(serviceId: ServiceId, name: string, next: string): string {
+  const profile = profileOf(serviceId, name)
+  if (profile && !ownsProfile(profile)) return stripRefresh(serviceId, next)
+  vault.saveSecret(serviceId, name, next)
+  return next
 }
 
 function storedBlob(serviceId: ServiceId, name: string): string | null {
@@ -102,8 +121,7 @@ export function refreshClaude(name: string, blob: string): Promise<string | null
     const out = JSON.stringify({ ...parsed, keychain: JSON.stringify({ claudeAiOauth: next }) })
     const latest = storedBlob('claude-code', name)
     if (latest && claudeExpiry(latest) > next.expiresAt) return latest
-    vault.saveSecret('claude-code', name, out)
-    return out
+    return saveRefreshed('claude-code', name, out)
   })
 }
 
@@ -128,8 +146,7 @@ export function refreshCodex(name: string, blob: string): Promise<string | null>
     const latestAt = latest ? accessExpiry('codex', latest) : null
     const nextAt = accessExpiry('codex', next)
     if (latest && latestAt !== null && nextAt !== null && latestAt > nextAt) return latest
-    vault.saveSecret('codex', name, next)
-    return next
+    return saveRefreshed('codex', name, next)
   })
 }
 

@@ -1,4 +1,5 @@
 import { fetch } from '../config'
+import { createHash } from 'node:crypto'
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -9,8 +10,9 @@ import { cliProcesses, killAndWait, reopenSession, terminalOwns } from '../procs
 import type { Adapter, Captured, RefreshBlob, UsageResult } from './types'
 import { decodeJwtPayload, retryAfterMs } from './types'
 
-const CODEX_DIR = join(homedir(), '.codex')
-const AUTH_PATH = join(CODEX_DIR, 'auth.json')
+/** The CLI's own directory, `$CODEX_HOME` else `~/.codex`, read at call time so a test can point it elsewhere. */
+export const codexDir = (): string => process.env.CODEX_HOME || join(homedir(), '.codex')
+const authPath = (): string => join(codexDir(), 'auth.json')
 const DESKTOP_APP = 'Codex'
 const DESKTOP_APP_PATH = '/Applications/Codex.app'
 
@@ -133,6 +135,16 @@ function planFromAuth(authJson: string): PlanInfo | undefined {
 /** Renew stored logins once the access token has under two days left. */
 const REFRESH_MARGIN_MS = 48 * 3_600_000
 
+/** sha256 of the blob's refresh token, or null for a blob that cannot refresh (an API key, an access-only copy). */
+function lineageOf(authJson: string): string | null {
+  try {
+    const token = (JSON.parse(authJson) as { tokens?: { refresh_token?: unknown } }).tokens?.refresh_token
+    return typeof token === 'string' ? createHash('sha256').update(token).digest('hex') : null
+  } catch {
+    return null
+  }
+}
+
 /** Milliseconds until the stored access token expires; null when unreadable. */
 export function accessMsLeft(authJson: string): number | null {
   try {
@@ -191,7 +203,7 @@ function readFirstLine(path: string): string {
 
 /** Newest session id recorded for a working directory, from rollout file metadata. */
 function latestSessionFor(cwd: string): string | null {
-  const root = join(CODEX_DIR, 'sessions')
+  const root = join(codexDir(), 'sessions')
   if (!existsSync(root)) return null
   const files: { path: string; mtime: number }[] = []
   const walk = (dir: string): void => {
@@ -224,19 +236,37 @@ export const codex: Adapter = {
     { id: 'desktop', label: 'Codex app' }
   ],
 
-  detect: () => existsSync(CODEX_DIR),
+  detect: () => existsSync(codexDir()),
 
   async liveAccountId() {
     try {
-      return identity(readFileSync(AUTH_PATH, 'utf8')).accountId
+      return identity(readFileSync(authPath(), 'utf8')).accountId
     } catch {
       return null
     }
   },
 
+  /**
+   * Token-level identity of a grant, as claude.ts does it: the refresh token
+   * rotates with every renewal, so matching the live file's against a stored
+   * blob's says whether the blob IS the grant the CLI here keeps refreshing.
+   * Handing that one to another host would put two refreshers on it.
+   */
+  async liveFingerprint() {
+    try {
+      return lineageOf(readFileSync(authPath(), 'utf8'))
+    } catch {
+      return null
+    }
+  },
+
+  fingerprintOf(blob: string) {
+    return lineageOf(blob)
+  },
+
   async capture(): Promise<Captured> {
-    if (!existsSync(AUTH_PATH)) throw new Error('not signed in. Use Add account')
-    const blob = readFileSync(AUTH_PATH, 'utf8')
+    if (!existsSync(authPath())) throw new Error('not signed in. Use Add account')
+    const blob = readFileSync(authPath(), 'utf8')
     return { ...identity(blob), blob }
   },
 
@@ -260,7 +290,7 @@ export const codex: Adapter = {
 
     if (sessions.length > 0) await killAndWait(sessions.map((s) => s.pid))
 
-    writeFileSync(AUTH_PATH, blob, { mode: 0o600 })
+    writeFileSync(authPath(), blob, { mode: 0o600 })
 
     if (wasRunning) {
       await launchApp(DESKTOP_APP)

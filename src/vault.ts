@@ -29,6 +29,8 @@ export interface StoredProfile {
   static?: boolean
   /** When a copy was last exchanged with another environment. */
   syncedAt?: number
+  /** This host handed the grant to `owner` and has not yet told it so (sync.ts confirmHandoff / clearReleased). */
+  releasedAt?: number
 }
 
 type Meta = Partial<Record<ServiceId, StoredProfile[]>>

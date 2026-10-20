@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SaveOrigin } from '../src/config'
+import { isLocked } from '../src/lock'
 import * as sync from '../src/sync'
 import * as vault from '../src/vault'
 import { tempCore } from './helpers'
@@ -117,38 +118,92 @@ describe('applyTransfer', () => {
     expiresAt: sync.accessExpiry('claude-code', blob)
   })
 
-  it('a handoff addressed to this host lands the grant and makes it the owner; one for another host is refused', () => {
+  it('a handoff addressed to this host lands the grant provisionally, with the fingerprint of what it saved; one for another host is refused', () => {
     core({ environmentId: 'env_box' })
-    expect(sync.applyTransfer(transfer('handoff', 'env_other', claudeBlob(later)))).toEqual({ ok: false, reason: 'not-for-us' })
-    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(later, null)))).toEqual({ ok: false, reason: 'bad-blob' })
-    const out = sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(later)))
-    expect(out).toEqual({ ok: true, name: 'a@x', saved: true, owner: 'env_box', expiresAt: later })
+    expect(sync.applyTransfer(transfer('handoff', 'env_other', claudeBlob(later)), 'env_mac')).toEqual({ ok: false, reason: 'not-for-us' })
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(later, null)), 'env_mac')).toEqual({ ok: false, reason: 'bad-blob' })
+    const sent = claudeBlob(later)
+    const out = sync.applyTransfer(transfer('handoff', 'env_box', sent), 'env_mac')
+    expect(out).toEqual({ ok: true, name: 'a@x', saved: true, owner: 'env_mac', expiresAt: later, refreshFingerprint: sync.refreshFingerprint('claude-code', sent) })
     const p = vault.profiles('claude-code')[0]
-    expect(p).toMatchObject({ name: 'a@x', accountId: 'u1', email: 'a@x', createdAt: 5, owner: 'env_box', static: false })
+    // The row still names the sender: nothing here refreshes the grant until the sender says it stripped its own copy.
+    expect(p).toMatchObject({ name: 'a@x', accountId: 'u1', email: 'a@x', createdAt: 5, owner: 'env_mac', static: false })
     expect(p.syncedAt).toBeGreaterThan(0)
     expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(true)
-    expect(sync.ownsProfile(p)).toBe(true)
-    // The same handoff again saves nothing new and still answers ok.
-    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(later)))).toMatchObject({ ok: true, saved: true })
-    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(earlier)))).toMatchObject({ ok: true, saved: false, expiresAt: later })
+    expect(sync.ownsProfile(p)).toBe(false)
+    expect(sync.isProvisional('claude-code', p)).toBe(true)
+    // The same handoff again saves again and answers the same fingerprint.
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', sent), 'env_mac')).toMatchObject({ ok: true, saved: true, refreshFingerprint: sync.refreshFingerprint('claude-code', sent) })
+    // The sender's word makes this host the owner; twice is fine; a stranger's word is not.
+    expect(sync.claimHandoff('claude-code', 'a@x', 'env_other')).toBe(false)
+    expect(sync.claimHandoff('claude-code', 'a@x', 'env_mac')).toBe(true)
+    expect(sync.claimHandoff('claude-code', 'a@x', 'env_mac')).toBe(true)
+    expect(vault.profiles('claude-code')[0]).toMatchObject({ owner: 'env_box' })
+    expect(sync.ownsProfile(vault.profiles('claude-code')[0])).toBe(true)
+    expect(sync.isProvisional('claude-code', vault.profiles('claude-code')[0])).toBe(false)
+    // An older handoff onto a host that holds a refresh token changes nothing and names the token it holds.
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(earlier)), 'env_mac')).toEqual({ ok: true, name: 'a@x', saved: false, owner: 'env_box', expiresAt: later, refreshFingerprint: sync.refreshFingerprint('claude-code', sent) })
+    expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(true)
+  })
+
+  it('an older handoff onto an access-only copy is refused as stale, so the sender keeps its only refresh token', () => {
+    core({ environmentId: 'env_box' })
+    vault.upsertProfile('claude-code', { name: 'a@x', accountId: 'u1', createdAt: 1, owner: 'env_mac' })
+    vault.saveSecret('claude-code', 'a@x', claudeBlob(later, null))
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(earlier)), 'env_mac')).toEqual({ ok: false, reason: 'stale' })
+    expect(vault.profiles('claude-code')[0]).toMatchObject({ owner: 'env_mac' })
+    expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(false)
+    expect(sync.claimHandoff('claude-code', 'a@x', 'env_mac')).toBe(false)
+    // A fresher one lands.
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(later + 1)), 'env_mac')).toMatchObject({ ok: true, saved: true, refreshFingerprint: expect.any(String) })
+  })
+
+  it('under the peer policy only an account already on file may arrive, and an access copy must name its sender', () => {
+    core({ environmentId: 'env_mac' })
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later)), 'env_box', 'peer')).toEqual({ ok: false, reason: 'unknown-account' })
+    expect(sync.applyTransfer(transfer('access', null, claudeBlob(later), { static: true }), 'env_box', 'peer')).toEqual({ ok: false, reason: 'unknown-account' })
+    expect(vault.profiles('claude-code')).toEqual([])
+    vault.upsertProfile('claude-code', { name: 'a@x', accountId: 'u1', email: 'a@x', createdAt: 1, owner: 'env_box' })
+    vault.saveSecret('claude-code', 'a@x', claudeBlob(earlier, null))
+    // A copy the sender claims a third host owns is not the sender's to push.
+    expect(sync.applyTransfer(transfer('access', 'env_third', claudeBlob(later)), 'env_box', 'peer')).toEqual({ ok: false, reason: 'not-owner' })
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later)), 'env_box', 'peer')).toMatchObject({ ok: true, saved: true, owner: 'env_box' })
+    // The same account by email alone still counts as on file; a static token for a row that is not static does not.
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later + 1), { accountId: 'u1-renamed' }), 'env_box', 'peer')).toMatchObject({ ok: true, saved: true })
+    expect(sync.applyTransfer(transfer('access', null, claudeBlob(later + 2), { static: true }), 'env_box', 'peer')).toEqual({ ok: false, reason: 'unknown-account' })
+    // An admin sender may bring a new account.
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later), { name: 'n', accountId: 'u2', email: 'n@x' }), 'env_box')).toMatchObject({ ok: true, saved: true })
+  })
+
+  it('an access copy never voids a grant someone else is handing over; the owner it names may, by its own copy', () => {
+    core({ environmentId: 'env_box' })
+    const sent = claudeBlob(later)
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', sent), 'env_mac')).toMatchObject({ ok: true, saved: true })
+    // A third host's access copy: the grant from env_mac is still being settled.
+    expect(sync.applyTransfer(transfer('access', 'env_third', claudeBlob(later + 1)), 'env_third')).toEqual({ ok: false, reason: 'provisional' })
+    expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(true)
+    // env_mac's own access copy means it kept the grant: the provisional copy gives way.
+    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(later + 1)), 'env_mac')).toMatchObject({ ok: true, saved: true, owner: 'env_mac' })
+    expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(false)
+    expect(sync.claimHandoff('claude-code', 'a@x', 'env_mac')).toBe(false)
   })
 
   it('an access copy lands without a refresh token and names its owner; never where this host owns the grant', () => {
     core({ environmentId: 'env_mac' })
-    const out = sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later)))
-    expect(out).toMatchObject({ ok: true, saved: true, owner: 'env_box', expiresAt: later })
+    const out = sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later)), 'env_box')
+    expect(out).toMatchObject({ ok: true, saved: true, owner: 'env_box', expiresAt: later, refreshFingerprint: null })
     expect(sync.hasRefresh('claude-code', vault.readSecret('claude-code', 'a@x')!)).toBe(false)
     expect(vault.profiles('claude-code')[0]).toMatchObject({ owner: 'env_box', static: false })
     // Older never lands; same or newer does.
-    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(earlier)))).toMatchObject({ ok: true, saved: false, expiresAt: later })
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(earlier)), 'env_box')).toMatchObject({ ok: true, saved: false, expiresAt: later })
     expect(tokensOf(vault.readSecret('claude-code', 'a@x')!).accessToken).toBe(`T${later}`)
-    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later + 1)))).toMatchObject({ ok: true, saved: true, expiresAt: later + 1 })
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later + 1)), 'env_box')).toMatchObject({ ok: true, saved: true, expiresAt: later + 1 })
     // A copy claiming this host as owner, or arriving for a grant this host owns, is a conflict.
-    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(later + 2)))).toEqual({ ok: false, reason: 'owner-mismatch' })
+    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(later + 2)), 'env_mac')).toEqual({ ok: false, reason: 'owner-mismatch' })
     vault.upsertProfile('claude-code', { name: 'mine', accountId: 'u9', createdAt: 1 })
     vault.saveSecret('claude-code', 'mine', claudeBlob(later))
-    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later + 3), { name: 'mine', accountId: 'u9', email: undefined }))).toEqual({ ok: false, reason: 'owner-mismatch' })
-    expect(sync.applyTransfer(transfer('access', null, claudeBlob(later + 3)))).toEqual({ ok: false, reason: 'owner-mismatch' })
+    expect(sync.applyTransfer(transfer('access', 'env_box', claudeBlob(later + 3), { name: 'mine', accountId: 'u9', email: undefined }), 'env_box')).toEqual({ ok: false, reason: 'owner-mismatch' })
+    expect(sync.applyTransfer(transfer('access', null, claudeBlob(later + 3)), 'env_box')).toEqual({ ok: false, reason: 'owner-mismatch' })
   })
 
   it('a static token replaces a consumer copy, keeps the row, and is never replaced by a push', () => {
@@ -157,24 +212,24 @@ describe('applyTransfer', () => {
     vault.saveSecret('claude-code', 'kept-name', claudeBlob(earlier, null))
     const year = Date.now() + 365 * 86_400_000
     const staticBlob = JSON.stringify({ keychain: JSON.stringify({ claudeAiOauth: { accessToken: 'OAT', expiresAt: year, scopes: ['user:inference'] } }), oauthAccount: { accountUuid: 'u1' }, tokenKind: 'static' })
-    const out = sync.applyTransfer(transfer('access', null, staticBlob, { static: true }))
-    expect(out).toEqual({ ok: true, name: 'kept-name', saved: true, owner: null, expiresAt: year })
+    const out = sync.applyTransfer(transfer('access', null, staticBlob, { static: true }), 'env_mac')
+    expect(out).toEqual({ ok: true, name: 'kept-name', saved: true, owner: null, expiresAt: year, refreshFingerprint: null })
     const p = vault.profiles('claude-code')[0]
     expect(p).toMatchObject({ name: 'kept-name', color: 'c1', nickname: 'nick', static: true })
     expect(p.owner).toBeUndefined()
     expect(sync.isStaticBlob(vault.readSecret('claude-code', 'kept-name')!)).toBe(true)
-    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(year + 1)))).toEqual({ ok: false, reason: 'static' })
-    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(year + 1)))).toEqual({ ok: false, reason: 'static' })
+    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(year + 1)), 'env_mac')).toEqual({ ok: false, reason: 'static' })
+    expect(sync.applyTransfer(transfer('handoff', 'env_box', claudeBlob(year + 1)), 'env_mac')).toEqual({ ok: false, reason: 'static' })
   })
 
   it('refuses everything on a host with no environment id', () => {
     core()
-    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(later)))).toEqual({ ok: false, reason: 'no-environment' })
+    expect(sync.applyTransfer(transfer('access', 'env_mac', claudeBlob(later)), 'env_mac')).toEqual({ ok: false, reason: 'no-environment' })
   })
 })
 
 describe('the sender after a handoff', () => {
-  it('confirmHandoff strips the refresh token and records the owner, as a sync write; releaseTo does both and hands the grant out', () => {
+  it('confirmHandoff strips the refresh token, records the owner and the release, as a sync write; clearReleased forgets the release', () => {
     const saved: [string, SaveOrigin][] = []
     core({ environmentId: 'env_mac', hooks: { onSecretSaved: (_s, name, origin) => saved.push([name, origin]) } })
     vault.upsertProfile('claude-code', { name: 'a@x', accountId: 'u1', createdAt: 1 })
@@ -186,17 +241,55 @@ describe('the sender after a handoff', () => {
     expect(sync.hasRefresh('claude-code', stored)).toBe(false)
     expect(JSON.parse(stored).appSession).toEqual([{ name: 'sessionKey' }])
     expect(vault.profiles('claude-code')[0]).toMatchObject({ owner: 'env_box', static: false })
+    expect(vault.profiles('claude-code')[0].releasedAt).toBeGreaterThan(0)
     expect(sync.ownsProfile(vault.profiles('claude-code')[0])).toBe(false)
+    sync.clearReleased('claude-code', 'a@x')
+    expect(vault.profiles('claude-code')[0].releasedAt).toBeUndefined()
+    sync.markSynced('claude-code', 'a@x')
+    expect(vault.profiles('claude-code')[0].syncedAt).toBeGreaterThan(0)
+  })
 
+  it('beginHandoff holds the lock from the export to commit or abort; commit strips, abort keeps the grant', async () => {
+    core({ environmentId: 'env_mac' })
     vault.upsertProfile('codex', { name: 'c', accountId: 'acct', createdAt: 1 })
     vault.saveSecret('codex', 'c', codexBlob(later))
-    const out = sync.releaseTo('codex', 'c', 'env_box')
-    expect(out).toMatchObject({ service: 'codex', mode: 'handoff', profile: { owner: 'env_box' } })
-    expect(sync.hasRefresh('codex', out.blob)).toBe(true)
+    const h = await sync.beginHandoff('codex', 'c', 'env_box')
+    expect(h.transfer).toMatchObject({ service: 'codex', mode: 'handoff', profile: { owner: 'env_box' } })
+    expect(sync.hasRefresh('codex', h.transfer.blob)).toBe(true)
+    expect(h.fingerprint).toBe(sync.refreshFingerprint('codex', h.transfer.blob))
+    expect(isLocked('codex', 'c')).toBe(true)
+    // A second handoff of the same grant waits for the first to settle.
+    let second: sync.Handoff | null = null
+    const waiting = sync.beginHandoff('codex', 'c', 'env_other').then((x) => (second = x))
+    await new Promise((r) => setTimeout(r, 10))
+    expect(second).toBeNull()
+    h.abort()
+    expect(sync.hasRefresh('codex', vault.readSecret('codex', 'c')!)).toBe(true)
+    expect(vault.profiles('codex')[0].owner).toBeUndefined()
+    await waiting
+    expect(second).not.toBeNull()
+    second!.commit()
+    second!.commit()
+    expect(isLocked('codex', 'c')).toBe(false)
     expect(sync.hasRefresh('codex', vault.readSecret('codex', 'c')!)).toBe(false)
-    expect(vault.profiles('codex')[0].owner).toBe('env_box')
-    sync.markSynced('codex', 'c')
-    expect(vault.profiles('codex')[0].syncedAt).toBeGreaterThan(0)
+    expect(vault.profiles('codex')[0]).toMatchObject({ owner: 'env_other' })
+    expect(vault.profiles('codex')[0].releasedAt).toBeGreaterThan(0)
+    // Nothing left to hand off: the export fails and the lock is not kept.
+    await expect(sync.beginHandoff('codex', 'c', 'env_box')).rejects.toThrow(/refreshed by env_other/)
+    expect(isLocked('codex', 'c')).toBe(false)
+  })
+
+  it('refreshFingerprint digests the refresh token of every service and never the token itself', () => {
+    core()
+    const claude = sync.refreshFingerprint('claude-code', claudeBlob(later, 'secret-R'))!
+    expect(claude).toMatch(/^[0-9a-f]{16}$/)
+    expect(claude).not.toContain('secret')
+    expect(sync.refreshFingerprint('claude-code', claudeBlob(later, 'secret-R'))).toBe(claude)
+    expect(sync.refreshFingerprint('claude-code', claudeBlob(later, 'other'))).not.toBe(claude)
+    expect(sync.refreshFingerprint('claude-code', claudeBlob(later, null))).toBeNull()
+    expect(sync.refreshFingerprint('codex', codexBlob(later))).toMatch(/^[0-9a-f]{16}$/)
+    expect(sync.refreshFingerprint('cursor', cursorBlob(later))).toMatch(/^[0-9a-f]{16}$/)
+    expect(sync.refreshFingerprint('codex', 'garbage')).toBeNull()
   })
 })
 
