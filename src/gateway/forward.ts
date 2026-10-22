@@ -10,7 +10,7 @@ import { hooks } from '../config'
 import { cachedReport, observeLimit } from '../accounts'
 import { blockedWindow, serviceIdOf, tiersFor } from './failover'
 import { classify429, type Limit } from './limits'
-import type { ServiceId } from '../shared/types'
+import type { ServiceId, UsageReport } from '../shared/types'
 import { ownsProfile } from '../sync'
 import * as vault from '../vault'
 
@@ -77,6 +77,8 @@ export const isForbiddenHeader = (name: string): boolean =>
 export interface Credential {
   authorization: string
   extraHeaders?: Record<string, string>
+  /** When the access token lapses (epoch ms), when the source says; a host that caches the credential keeps it no longer. */
+  expiresAt?: number
 }
 
 /** Renew the pinned Claude profile in place when its access token is expiring. */
@@ -113,8 +115,9 @@ async function refreshCodexIfNeeded(name: string, raw: string): Promise<void> {
 
 const bearer = (keychain: string): Credential | null => {
   try {
-    const token = JSON.parse(keychain)?.claudeAiOauth?.accessToken
-    return typeof token === 'string' ? { authorization: `Bearer ${token}` } : null
+    const tokens = JSON.parse(keychain)?.claudeAiOauth
+    if (typeof tokens?.accessToken !== 'string') return null
+    return { authorization: `Bearer ${tokens.accessToken}`, ...(typeof tokens.expiresAt === 'number' ? { expiresAt: tokens.expiresAt } : {}) }
   } catch {
     return null
   }
@@ -212,15 +215,62 @@ async function codexCredential(account: string | null): Promise<Credential | nul
     if (typeof tokens.access_token !== 'string') return null
     const extraHeaders: Record<string, string> = {}
     if (typeof tokens.account_id === 'string') extraHeaders['chatgpt-account-id'] = tokens.account_id
-    return { authorization: `Bearer ${tokens.access_token}`, extraHeaders }
+    const exp = jwtExpiry(tokens.access_token)
+    return { authorization: `Bearer ${tokens.access_token}`, extraHeaders, ...(exp ? { expiresAt: exp } : {}) }
   } catch {
     return null
+  }
+}
+
+/** A JWT's `exp` in epoch ms, or 0 when the token is not one. */
+function jwtExpiry(token: string): number {
+  try {
+    const exp = (JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()) as { exp?: unknown }).exp
+    return typeof exp === 'number' ? exp * 1000 : 0
+  } catch {
+    return 0
   }
 }
 
 /** The credential to send for `service`, under `account` when a request names one. */
 export const credentialFor = (service: string, account: string | null = null): Promise<Credential | null> =>
   service === 'claude' ? claudeCredential(account) : codexCredential(account)
+
+/**
+ * Everything the forward reads or writes of this machine's accounts. A
+ * gateway that runs in a process of its own (temp-code's) passes one so that
+ * process never opens the vault, the Keychain, the settings file or the usage
+ * cache and never refreshes a token: its host answers from its own copy.
+ * Absent, the forward uses this module's own reads (`localAccounts`), as an
+ * in-process gateway always has.
+ */
+export interface AccountSource {
+  /** The credential for `service` under `account`, or under the pinned account for null; null when none is usable. */
+  credentialFor(service: string, account: string | null): Promise<Credential | null>
+  /** Whether `name` is a saved account of the service. */
+  hasProfile(serviceId: ServiceId, name: string): boolean | Promise<boolean>
+  /** The account unscoped traffic spends from. */
+  pinned(serviceId: ServiceId): string | null | Promise<string | null>
+  /** The usage report on file for one account, however old. */
+  report(serviceId: ServiceId, name: string): UsageReport | undefined | Promise<UsageReport | undefined>
+  /** A 429 charged one of the account's windows. */
+  observeLimit(serviceId: ServiceId, name: string, limit: Limit): void
+  /** Unscoped failover moved the pin to `name`. */
+  pin(serviceId: ServiceId, name: string): void | Promise<void>
+}
+
+/** The forward's own reads: this machine's vault, Keychain, settings and usage cache. */
+export const localAccounts: AccountSource = {
+  credentialFor,
+  hasProfile: (serviceId, name) => vault.profiles(serviceId).some((p) => p.name === name),
+  pinned: pinnedProfile,
+  report: cachedReport,
+  observeLimit: (serviceId, name, limit) => void observeLimit(serviceId, name, limit),
+  pin: (serviceId, name) => {
+    pinProfile(serviceId, name)
+    hooks().onAccountsChanged?.()
+  }
+}
 
 export function fail(res: ServerResponse, status: number, message: string): void {
   if (res.headersSent) {
@@ -359,6 +409,8 @@ export interface ForwardHooks {
   onFailedOver?: (info: { service: string; serviceId: ServiceId; from: string; to: string }) => void
   /** A scoped thread routes to a different account from now on (override set or dropped). */
   onRouted?: (info: RoutedInfo) => void
+  /** Where credentials, the pin and the usage reports come from; this machine's own when absent (see AccountSource). */
+  accounts?: AccountSource
 }
 
 /** Replays per request: past this the 429 goes to the client as it came. */
@@ -411,6 +463,7 @@ export async function forward(
 
   const body = input.body ?? (['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req))
   const serviceId = serviceIdOf(service)
+  const source = on.accounts ?? localAccounts
   const model = input.model !== undefined ? input.model : (scanModel(body) ?? scope?.model ?? null)
   const tried: string[] = []
   let switchedFrom: string | null = null
@@ -433,10 +486,10 @@ export async function forward(
       on.onRouted?.({ service, serviceId, thread: scope.thread, account })
     }
     // A pinned thread goes back to its pin as soon as the pin has room again.
-    if (scope.pin && target !== scope.account && !blockedWindow(cachedReport(serviceId, scope.account), tiers, now)) {
+    if (scope.pin && target !== scope.account && !blockedWindow(await source.report(serviceId, scope.account), tiers, now)) {
       route(scope.account)
     }
-    const blocked = on.pickNext ? blockedWindow(cachedReport(serviceId, target), tiers, now) : null
+    const blocked = on.pickNext ? blockedWindow(await source.report(serviceId, target), tiers, now) : null
     if (blocked) {
       const next = await on
         .pickNext!({ service, serviceId, model, limit: blocked, tried: [target], account: target, thread: scope.thread })
@@ -449,12 +502,12 @@ export async function forward(
   // the host names one) and sends the same bytes again. Bounded, and never for
   // a transient 429, which the CLI retries itself.
   for (;;) {
-    if (target && serviceId && !vault.profiles(serviceId).some((p) => p.name === target)) {
+    if (target && serviceId && !(await source.hasProfile(serviceId, target))) {
       fail(res, 503, `Aliax has no saved account "${target}" for ${service}. Add it in Aliax or pick another account.`)
       return { service, status: null }
     }
-    const account = target ?? (serviceId ? pinnedProfile(serviceId) : null)
-    const credential = await credentialFor(service, target)
+    const account = target ?? (serviceId ? await source.pinned(serviceId) : null)
+    const credential = await source.credentialFor(service, target)
     if (!credential) {
       fail(
         res,
@@ -497,7 +550,7 @@ export async function forward(
     if (rejected === undefined || !serviceId || !on.pickNext || !account) break
     const limit = classify429(service, upstreamRes.headers, rejected, model)
     if (limit.window === 'transient') break
-    observeLimit(serviceId, account, limit)
+    source.observeLimit(serviceId, account, limit)
     if (tried.length >= MAX_REPLAYS) break
     tried.push(account)
     const next = await on
@@ -513,12 +566,11 @@ export async function forward(
       continue
     }
     // Sticky by design: the pin moves only here or on a user's click, never on success.
-    pinProfile(serviceId, next)
+    await source.pin(serviceId, next)
     switchedFrom ??= account
-    hooks().onAccountsChanged?.()
   }
   if (switchedFrom && serviceId && upstreamRes.status < 400) {
-    on.onFailedOver?.({ service, serviceId, from: switchedFrom, to: pinnedProfile(serviceId) ?? '' })
+    on.onFailedOver?.({ service, serviceId, from: switchedFrom, to: (await source.pinned(serviceId)) ?? '' })
   }
 
   const outHeaders: Record<string, string> = {}

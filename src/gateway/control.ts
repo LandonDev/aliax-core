@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import * as accounts from '../accounts'
-import type { ServiceId } from '../shared/types'
+import type { ServiceId, UsageReport } from '../shared/types'
 import type { Owner } from './marker'
 
 /**
@@ -21,15 +21,27 @@ import type { Owner } from './marker'
  */
 export const FEATURES = ['scoped-routes'] as const
 
+/**
+ * For a gateway that serves from a process of its own: the pid the marker
+ * names (its host's, which the liveness answer must agree with) and the usage
+ * poll, which reads the vault and so runs in the host. This process's pid and
+ * `accounts.usage` when absent.
+ */
+export interface ControlOptions {
+  pid?: number
+  usage?: (serviceId: ServiceId, force: boolean) => Promise<UsageReport[]>
+}
+
 export async function handleControl(
   req: IncomingMessage,
   res: ServerResponse,
-  owner: Owner
+  owner: Owner,
+  options: ControlOptions = {}
 ): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   url.pathname = url.pathname.replace(/^\/(?:claude|codex)(?=\/__aliax)/, '')
   if (url.pathname === '/__aliax') {
-    json(res, 200, { ok: true, pid: process.pid, owner, features: FEATURES })
+    json(res, 200, { ok: true, pid: options.pid ?? process.pid, owner, features: FEATURES })
     return true
   }
   if (url.pathname === '/__aliax/usage') {
@@ -39,7 +51,7 @@ export async function handleControl(
       return true
     }
     try {
-      const reports = await accounts.usage(service, url.searchParams.get('force') === '1')
+      const reports = await (options.usage ?? accounts.usage)(service, url.searchParams.get('force') === '1')
       json(res, 200, { reports })
     } catch (e) {
       json(res, 500, { error: (e as Error).message })
