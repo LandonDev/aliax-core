@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as accounts from '../src/accounts'
-import { clearRoutes, forward, parseScope, routeOf, splitPath, type ForwardHooks } from '../src/gateway/forward'
+import { clearRoutes, forward, MODEL_SCAN_BYTES, parseScope, routeOf, scanModel, splitPath, type ForwardHooks } from '../src/gateway/forward'
 import { OPENAI_TOKEN_URL } from '../src/oauth'
 import { pinProfile, pinnedProfile } from '../src/settings'
 import * as vault from '../src/vault'
@@ -52,6 +52,22 @@ describe('scope parsing', () => {
     expect(parseScope('v1')).toBeNull()
     expect(parseScope('~t=%E0%A4%A;a=B')).toBeNull()
   })
+  it('reads the model off `m=`, decoded, and leaves it out when absent', () => {
+    expect(parseScope('~t=T;a=B;m=claude-opus-5-5')).toEqual({ thread: 'T', account: 'B', pin: false, model: 'claude-opus-5-5' })
+    expect(parseScope('~t=T;a=B;pin=1;m=gpt-6.1-sol')).toEqual({ thread: 'T', account: 'B', pin: true, model: 'gpt-6.1-sol' })
+    expect(parseScope('~t=T;a=B;m=')).toEqual({ thread: 'T', account: 'B', pin: false })
+    expect(splitPath('/claude/~t=T;a=B;m=claude-fable-5-1/v1/messages')).toEqual({ service: 'claude', rest: '/v1/messages', scope: { thread: 'T', account: 'B', pin: false, model: 'claude-fable-5-1' } })
+  })
+  it('scanModel reads the model off the first bytes and never parses the body', () => {
+    expect(scanModel(Buffer.from('{"model":"gpt-6-astra","input":"hi"}'))).toBe('gpt-6-astra')
+    expect(scanModel(Buffer.from('{ "max_tokens": 8, "model" : "claude-opus-5-5" }'))).toBe('claude-opus-5-5')
+    expect(scanModel(Buffer.from('{"input":"hi"}'))).toBeNull()
+    expect(scanModel(Buffer.from('not json at all, "model":"x" still counts'))).toBe('x')
+    expect(scanModel(undefined)).toBeNull()
+    expect(scanModel(Buffer.alloc(0))).toBeNull()
+    const far = Buffer.from(JSON.stringify({ input: 'x'.repeat(MODEL_SCAN_BYTES), model: 'gpt-6-astra' }))
+    expect(scanModel(far)).toBeNull()
+  })
   it('splitPath strips the scope before the upstream path, and leaves other paths alone', () => {
     expect(splitPath('/claude/~t=T;a=me%40x.io;pin=1/v1/messages')).toEqual({
       service: 'claude',
@@ -65,6 +81,34 @@ describe('scope parsing', () => {
 })
 
 describe('scoped forwarding', () => {
+  it('attributes the model from the body prefix, else the scope, else unknown', async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => ok())
+    cleanup = tempCore({ fetch }).cleanup
+    seed()
+    const models: (string | null)[] = []
+    const base = await serve({ onResponse: (i) => models.push(i.model) })
+    const at = (segment: string) => `${base}/codex/${segment}/v1/responses`
+    await globalThis.fetch(at('~t=T;a=B;m=gpt-6.1-sol'), { method: 'POST', body: '{"input":"hi"}' })
+    await globalThis.fetch(at('~t=T;a=B;m=gpt-6.1-sol'), { method: 'POST', body: '{"model":"gpt-6-astra","input":"hi"}' })
+    await globalThis.fetch(at('~t=T;a=B'), { method: 'POST', body: JSON.stringify({ input: 'x'.repeat(2000), model: 'gpt-6-astra' }) })
+    expect(models).toEqual(['gpt-6.1-sol', 'gpt-6-astra', null])
+  })
+
+  it('takes the body and model the caller collected and replays those bytes', async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => ok())
+    cleanup = tempCore({ fetch }).cleanup
+    seed()
+    const models: (string | null)[] = []
+    const body = Buffer.from('{"model":"gpt-6-astra","input":"hi"}')
+    server = createServer((req, res) => void forward(req, res, { onResponse: (i) => models.push(i.model) }, { body, model: 'given' }).catch(() => res.end()))
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    const res = await globalThis.fetch(`${base}${scoped('T', 'B')}`, { method: 'POST', body: 'ignored' })
+    expect(res.status).toBe(200)
+    expect(models).toEqual(['given'])
+    expect(Buffer.from((fetch.mock.calls[0][1] as RequestInit).body as Uint8Array).toString()).toBe(body.toString())
+  })
+
   it('spends from the named account and never touches the pin', async () => {
     const fetch = vi.fn(async (_url: string, _init?: RequestInit) => ok())
     cleanup = tempCore({ fetch }).cleanup

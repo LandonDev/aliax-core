@@ -244,7 +244,7 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
 /**
  * A scope segment names the thread a request belongs to and the account it
  * should spend from, so one gateway can serve many threads on many accounts:
- *   /claude/~t=<thread>;a=<account>[;pin=1]/v1/messages
+ *   /claude/~t=<thread>;a=<account>[;pin=1][;m=<model>]/v1/messages
  * `pin=1` says the account is an explicit pin (thread, project or workspace)
  * rather than an automatic pick; a pinned thread returns to its pin once that
  * account has room again, an automatic one stays where failover left it.
@@ -253,6 +253,8 @@ export interface RouteScope {
   thread: string
   account: string
   pin: boolean
+  /** The model the thread runs (`m=`), so no body need be parsed for it; a side call's body may still name another. */
+  model?: string
 }
 
 /** Parse one `~t=…;a=…` path segment; null when it is not a scope. */
@@ -269,7 +271,7 @@ export function parseScope(segment: string): RouteScope | null {
     }
   }
   if (!fields.t || !fields.a) return null
-  return { thread: fields.t, account: fields.a, pin: fields.pin === '1' }
+  return { thread: fields.t, account: fields.a, pin: fields.pin === '1', ...(fields.m ? { model: fields.m } : {}) }
 }
 
 /** Split `/codex/~t=T;a=A/v1/responses` into its service, scope and upstream path. */
@@ -362,14 +364,26 @@ export interface ForwardHooks {
 /** Replays per request: past this the 429 goes to the client as it came. */
 export const MAX_REPLAYS = 3
 
-const modelOf = (body: Buffer | undefined): string | null => {
+/** How much of a body `scanModel` reads: the CLIs put `model` first, so the prefix is enough. */
+export const MODEL_SCAN_BYTES = 1024
+const MODEL_RE = /"model"\s*:\s*"([^"]{1,128})"/
+
+/**
+ * The request body's `model`, read off its first bytes without parsing the
+ * body (a 1M-context turn is megabytes; the field sits in the first line).
+ * Null when the prefix does not name one.
+ */
+export function scanModel(body: Buffer | undefined): string | null {
   if (!body || body.length === 0) return null
-  try {
-    const model = JSON.parse(body.toString('utf8'))?.model
-    return typeof model === 'string' ? model : null
-  } catch {
-    return null
-  }
+  const m = MODEL_RE.exec(body.subarray(0, MODEL_SCAN_BYTES).toString('latin1'))
+  return m ? m[1] : null
+}
+
+export interface ForwardInput {
+  /** The body the caller already collected (replayed as these bytes); read from the request when absent. */
+  body?: Buffer
+  /** The model to attribute the request to; `scanModel(body) ?? scope.model` when absent. Null means unknown. */
+  model?: string | null
 }
 
 export interface ForwardOutcome {
@@ -385,7 +399,8 @@ export interface ForwardOutcome {
 export async function forward(
   req: IncomingMessage,
   res: ServerResponse,
-  on: ForwardHooks = {}
+  on: ForwardHooks = {},
+  input: ForwardInput = {}
 ): Promise<ForwardOutcome> {
   const { service, rest, scope } = splitPath(req.url ?? '/')
   const upstream = upstreamFor(service, rest)
@@ -394,9 +409,9 @@ export async function forward(
     return { service, status: null }
   }
 
-  const body = ['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req)
+  const body = input.body ?? (['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req))
   const serviceId = serviceIdOf(service)
-  const model = modelOf(body)
+  const model = input.model !== undefined ? input.model : (scanModel(body) ?? scope?.model ?? null)
   const tried: string[] = []
   let switchedFrom: string | null = null
   let upstreamRes: Response
