@@ -100,8 +100,9 @@ export const muse: Adapter = {
   id: 'muse-code',
   name: 'Muse Code',
   billingUrl: 'https://accountscenter.meta.com',
-  // The CLI signs in itself (`muse login`, a device code in the browser); the app runs it.
-  supportsLogin: false,
+  // The CLI signs in itself (`muse login`, a device code in the browser); the
+  // app's loginStart runs it and captures the file, so the panel offers Add account.
+  supportsLogin: true,
   targets: [],
 
   detect() {

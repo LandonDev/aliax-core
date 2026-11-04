@@ -52,7 +52,7 @@ describe('the muse-code adapter', () => {
     expect(museFingerprint(MUSE_LOGGED_OUT)).toBeNull()
     expect(await muse.identify!(text)).toEqual({ accountId: 'landon@example.com', email: 'Landon@Example.com' })
     expect(await muse.identify!(MUSE_LOGGED_OUT)).toBeNull()
-    expect(muse.supportsLogin).toBe(false)
+    expect(muse.supportsLogin).toBe(true)
     expect(muse.targets).toEqual([])
     expect(adapterForTest('muse-code')).toBe(muse)
   })
