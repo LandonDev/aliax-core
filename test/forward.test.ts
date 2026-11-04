@@ -42,6 +42,42 @@ describe('forward', () => {
     expect(upstreamFor('codex', '/wham/accounts/check')).toBe('https://chatgpt.com/backend-api')
   })
 
+  it('a scope naming the meta service sends either lane to api.meta.ai with the key as the bearer', async () => {
+    expect(upstreamFor('claude', '/v1/messages', 'meta')).toBe('https://api.meta.ai')
+    expect(upstreamFor('codex', '/v1/responses', 'meta')).toBe('https://api.meta.ai')
+    expect(upstreamFor('nope', '/v1/x', 'meta')).toBeNull()
+    expect(upstreamFor('claude', '/v1/messages', 'claude-code')).toBe('https://api.anthropic.com')
+    const calls: { url: string; init?: RequestInit }[] = []
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, init })
+      return jsonResponse({ ok: 1 })
+    })
+    ;({ cleanup } = tempCore({ fetch }))
+    vault.upsertProfile('meta', { name: 'k', accountId: '1607', createdAt: 1, static: true })
+    vault.saveSecret('meta', 'k', JSON.stringify({ key: 'LLM_1607_secret' }))
+    vault.upsertProfile('claude-code', { name: 'c', accountId: 'u', createdAt: 1 })
+    vault.saveSecret('claude-code', 'c', claudeAuth(Date.now() + 3_600_000, 'CLAUDE'))
+    server = createServer((req, res) => void forward(req, res).catch(() => res.end()))
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+    const port = (server.address() as { port: number }).port
+    const send = (path: string) =>
+      globalThis.fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { authorization: 'Bearer CLI', 'x-api-key': 'k', 'chatgpt-account-id': 'acct' }, body: '{"model":"muse-wonder-1.0"}' })
+    expect((await send('/claude/~t=T;a=k;s=meta/v1/messages')).status).toBe(200)
+    expect((await send('/codex/~t=T;a=k;s=meta/v1/responses')).status).toBe(200)
+    expect((await send('/claude/~t=T;a=c/v1/messages')).status).toBe(200)
+    expect(calls.map((c) => c.url)).toEqual(['https://api.meta.ai/v1/messages', 'https://api.meta.ai/v1/responses', 'https://api.anthropic.com/v1/messages'])
+    for (const c of calls.slice(0, 2)) {
+      const headers = c.init!.headers as Record<string, string>
+      expect(headers.authorization).toBe('Bearer LLM_1607_secret')
+      expect(headers['x-api-key']).toBeUndefined()
+      expect(headers['chatgpt-account-id']).toBeUndefined()
+    }
+    expect((calls[2].init!.headers as Record<string, string>).authorization).toBe('Bearer CLAUDE')
+    // A key the vault does not hold is the same clear 503 as any other account.
+    expect((await send('/claude/~t=T;a=nokey;s=meta/v1/messages')).status).toBe(503)
+    expect(calls).toHaveLength(3)
+  })
+
   it('swaps Authorization for the pinned account and streams the answer', async () => {
     const calls: { url: string; init?: RequestInit }[] = []
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {

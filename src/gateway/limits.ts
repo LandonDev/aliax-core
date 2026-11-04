@@ -244,5 +244,19 @@ function classifyCodex(body: string): Limit {
 export function classify429(service: string, headers: HeaderLike, body: string, model: string | null = null): Limit {
   if (service === 'claude') return classifyClaude(headers, body, model)
   if (service === 'codex') return classifyCodex(body)
+  if (service === 'meta') return classifyMeta(headers)
   return { window: 'transient' }
+}
+
+/**
+ * Meta's 429 is a per-team rate limit (requests or tokens per minute) with a
+ * `Retry-After`: transient, lifting when the header says. No window to
+ * charge, so the gateway never replays it onto another key (two keys of one
+ * team share the bucket); the host's own cooldown moves the next turn.
+ */
+function classifyMeta(headers: HeaderLike): Limit {
+  const raw = headers.get('retry-after')
+  const secs = raw === null ? NaN : Number(raw)
+  const resetsAt = Number.isFinite(secs) ? Date.now() + Math.max(0, secs) * 1000 : raw ? Date.parse(raw) : NaN
+  return { window: 'transient', ...(Number.isFinite(resetsAt) ? { resetsAt } : {}) }
 }

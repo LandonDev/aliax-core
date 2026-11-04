@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as accounts from '../src/accounts'
-import { clearRoutes, forward, MODEL_SCAN_BYTES, parseScope, routeOf, scanModel, splitPath, type ForwardHooks } from '../src/gateway/forward'
+import { clearRoutes, forward, MODEL_SCAN_BYTES, parseScope, routeOf, scanModel, scopeSegment, splitPath, type ForwardHooks } from '../src/gateway/forward'
 import { OPENAI_TOKEN_URL } from '../src/oauth'
 import { pinProfile, pinnedProfile } from '../src/settings'
 import * as vault from '../src/vault'
@@ -57,6 +57,20 @@ describe('scope parsing', () => {
     expect(parseScope('~t=T;a=B;pin=1;m=gpt-6.1-sol')).toEqual({ thread: 'T', account: 'B', pin: true, model: 'gpt-6.1-sol' })
     expect(parseScope('~t=T;a=B;m=')).toEqual({ thread: 'T', account: 'B', pin: false })
     expect(splitPath('/claude/~t=T;a=B;m=claude-fable-5-1/v1/messages')).toEqual({ service: 'claude', rest: '/v1/messages', scope: { thread: 'T', account: 'B', pin: false, model: 'claude-fable-5-1' } })
+  })
+  it('reads the service off `s=`, drops one it does not know, and scopeSegment writes what parseScope reads', () => {
+    expect(parseScope('~t=T;a=k1;m=muse-wonder-1.0;s=meta')).toEqual({ thread: 'T', account: 'k1', pin: false, model: 'muse-wonder-1.0', service: 'meta' })
+    expect(parseScope('~t=T;a=k1;s=nope')).toEqual({ thread: 'T', account: 'k1', pin: false })
+    expect(splitPath('/codex/~t=T;a=k1;s=meta/v1/responses')).toEqual({ service: 'codex', rest: '/v1/responses', scope: { thread: 'T', account: 'k1', pin: false, service: 'meta' } })
+    for (const scope of [
+      { thread: 'th/1', account: 'me@x.io', pin: true, model: 'claude-opus-5-5' },
+      { thread: 'T', account: 'Meta key …LJY', pin: false, model: 'muse-spark-1.3', service: 'meta' as const },
+      { thread: 'T', account: 'B', pin: false }
+    ]) {
+      const segment = scopeSegment(scope)
+      expect(segment.startsWith('~t=')).toBe(true)
+      expect(parseScope(segment)).toEqual(scope)
+    }
   })
   it('scanModel reads the model off the first bytes and never parses the body', () => {
     expect(scanModel(Buffer.from('{"model":"gpt-6-astra","input":"hi"}'))).toBe('gpt-6-astra')

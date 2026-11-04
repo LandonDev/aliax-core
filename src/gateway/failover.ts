@@ -16,6 +16,8 @@ export const serviceIdOf = (service: string): ServiceId | null =>
 /** The window labels a model spends, in the report's own vocabulary. */
 export function tiersFor(serviceId: ServiceId, model: string | null | undefined): string[] {
   if (serviceId === 'codex') return ['5h', 'week']
+  // Pay as you go: no window to spend, only a key that works or does not.
+  if (serviceId === 'meta') return []
   const tiers = ['5h', 'Weekly']
   const cap = scopedCapOf(serviceId, model)
   if (cap) tiers.push(cap)
@@ -96,9 +98,8 @@ const CREDITS = 'Credits'
  * The first required window (or credits) that is full and has not reset, as
  * the limit a 429 on it would classify to; null when the account has room.
  */
-export function blockedWindow(report: UsageReport | undefined, tiers: string[], now: number): Limit | null {
+export function blockedWindow(serviceId: ServiceId, report: UsageReport | undefined, tiers: string[], now: number): Limit | null {
   if (!report) return null
-  const serviceId: ServiceId = tiers.includes('week') ? 'codex' : 'claude-code'
   if (report.expired) return { window: 'credits' }
   for (const label of [...tiers, CREDITS]) {
     const w = report.windows.find((x) => x.label === label)
@@ -110,8 +111,8 @@ export function blockedWindow(report: UsageReport | undefined, tiers: string[], 
 }
 
 /** Room means every required window (and credits) is under 100 % or has already reset. */
-export const hasRoom = (report: UsageReport | undefined, tiers: string[], now: number): boolean =>
-  blockedWindow(report, tiers, now) === null
+export const hasRoom = (serviceId: ServiceId, report: UsageReport | undefined, tiers: string[], now: number): boolean =>
+  blockedWindow(serviceId, report, tiers, now) === null
 
 /**
  * Live threads an account carries before new picks sort it behind the rest.
@@ -196,7 +197,7 @@ export function candidates({ serviceId, profiles, reports, required, tried, now,
   return profiles
     .map((p) => p.name)
     .filter((name) => !tried.includes(name))
-    .filter((name) => hasRoom(reports.find((r) => r.profileName === name), required, now))
+    .filter((name) => hasRoom(serviceId, reports.find((r) => r.profileName === name), required, now))
     .sort(orderByReset(reports, now, { label: orderBy ?? weekly, weekly, spendFirst, load, cap }))
 }
 
@@ -243,7 +244,7 @@ export async function pickNext(input: PickInput): Promise<string | null> {
   const { required, orderBy, spendFirst } = plan(input)
   for (const name of candidates({ ...input, required, orderBy, spendFirst, now })) {
     const fresh = await input.poll(name).catch(() => null)
-    if (!fresh || hasRoom(fresh, required, now)) return name
+    if (!fresh || hasRoom(input.serviceId, fresh, required, now)) return name
   }
   return null
 }

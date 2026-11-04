@@ -17,6 +17,14 @@ describe('tiers', () => {
     expect(tiersFor('claude-code', null)).toEqual(['5h', 'Weekly'])
     expect(tiersFor('codex', 'gpt-6-astra')).toEqual(['5h', 'week'])
   })
+  it('a Meta key spends no window: pay as you go, blocked only by a revoked key', () => {
+    expect(tiersFor('meta', 'muse-wonder-1.0')).toEqual([])
+    expect(requiredTiers('meta', 'muse-wonder-1.0', ['muse-spark-1.3'])).toEqual([])
+    expect(blockedWindow('meta', report('k', []), [], NOW)).toBeNull()
+    expect(blockedWindow('meta', report('k', [], { expired: true }), [], NOW)).toEqual({ window: 'credits' })
+    expect(hasRoom('meta', report('k', [], { note: 'pay as you go' }), [], NOW)).toBe(true)
+    expect(pickFromCache({ serviceId: 'meta', model: 'muse-wonder-1.0', scoped: true, profiles: [{ name: 'dead' }, { name: 'live' }], reports: [report('dead', [], { expired: true }), report('live', [])], tried: [], now: NOW })).toBe('live')
+  })
   it('the union covers the request and every live model, without repeats', () => {
     expect(requiredTiers('claude-code', 'claude-sonnet-5', ['claude-fable-5-1', 'claude-sonnet-5'])).toEqual(['5h', 'Weekly', 'Fable'])
   })
@@ -31,12 +39,12 @@ describe('tiers', () => {
 
 describe('room and ordering', () => {
   it('a full window blocks unless it has already reset; an absent cap and a missing report count as room', () => {
-    expect(hasRoom(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h'], NOW)).toBe(false)
-    expect(hasRoom(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW - 1 }]), ['5h'], NOW)).toBe(true)
-    expect(hasRoom(report('a', [{ label: '5h', usedPercent: 99.9 }]), ['5h', 'Weekly', 'Fable'], NOW)).toBe(true)
-    expect(hasRoom(undefined, ['5h'], NOW)).toBe(true)
-    expect(hasRoom(report('a', [{ label: '5h', usedPercent: 1 }], { expired: true }), ['5h'], NOW)).toBe(false)
-    expect(hasRoom(report('a', [{ label: 'Credits', usedPercent: 100 }]), ['5h'], NOW)).toBe(false)
+    expect(hasRoom('claude-code', report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h'], NOW)).toBe(false)
+    expect(hasRoom('claude-code', report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW - 1 }]), ['5h'], NOW)).toBe(true)
+    expect(hasRoom('claude-code', report('a', [{ label: '5h', usedPercent: 99.9 }]), ['5h', 'Weekly', 'Fable'], NOW)).toBe(true)
+    expect(hasRoom('claude-code', undefined, ['5h'], NOW)).toBe(true)
+    expect(hasRoom('claude-code', report('a', [{ label: '5h', usedPercent: 1 }], { expired: true }), ['5h'], NOW)).toBe(false)
+    expect(hasRoom('claude-code', report('a', [{ label: 'Credits', usedPercent: 100 }]), ['5h'], NOW)).toBe(false)
   })
   it('orders by the weekly reset, unknown last, then a usage-limited account with no windows; no floor on how full', () => {
     const reports = [
@@ -141,11 +149,11 @@ describe('room and ordering', () => {
     expect(pickFromCache({ serviceId: 'claude-code', model: 'claude-opus-5-5', profiles, reports, tried: [], now: NOW })).toBe('fresh-soon')
   })
   it('blockedWindow names the full window as a limit, and the label maps back to a window', () => {
-    expect(blockedWindow(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h', 'Weekly'], NOW)).toEqual({ window: '5h', resetsAt: NOW + 1 })
-    expect(blockedWindow(report('a', [{ label: 'Fable', usedPercent: 100 }]), ['5h', 'Weekly', 'Fable'], NOW)).toEqual({ window: { model: 'Fable' }, resetsAt: undefined })
-    expect(blockedWindow(report('a', [{ label: 'week', usedPercent: 100 }]), ['5h', 'week'], NOW)).toEqual({ window: 'weekly', resetsAt: undefined })
-    expect(blockedWindow(report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW - 1 }]), ['5h'], NOW)).toBeNull()
-    expect(blockedWindow(undefined, ['5h'], NOW)).toBeNull()
+    expect(blockedWindow('claude-code', report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW + 1 }]), ['5h', 'Weekly'], NOW)).toEqual({ window: '5h', resetsAt: NOW + 1 })
+    expect(blockedWindow('claude-code', report('a', [{ label: 'Fable', usedPercent: 100 }]), ['5h', 'Weekly', 'Fable'], NOW)).toEqual({ window: { model: 'Fable' }, resetsAt: undefined })
+    expect(blockedWindow('codex', report('a', [{ label: 'week', usedPercent: 100 }]), ['5h', 'week'], NOW)).toEqual({ window: 'weekly', resetsAt: undefined })
+    expect(blockedWindow('claude-code', report('a', [{ label: '5h', usedPercent: 100, resetsAt: NOW - 1 }]), ['5h'], NOW)).toBeNull()
+    expect(blockedWindow('claude-code', undefined, ['5h'], NOW)).toBeNull()
     expect(windowOfLabel('claude-code', 'Credits')).toBe('credits')
     expect(windowOfLabel('codex', 'week')).toBe('weekly')
   })

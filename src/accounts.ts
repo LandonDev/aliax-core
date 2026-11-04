@@ -13,6 +13,7 @@ import { writeAtomic } from './fs'
 import { enabledTargets } from './settings'
 import { refreshFor } from './refresh'
 import { accessExpiry, hasRefresh, ownsProfile } from './sync'
+import { META_KEY_RE, metaAccountId, metaBlob, probeKey } from './adapters/meta'
 import * as vault from './vault'
 
 export const extra =
@@ -225,6 +226,44 @@ async function captureAll(a: Adapter): Promise<ActionResult> {
   return { ok: true, name, notes }
 }
 
+/**
+ * Save an API key as a static profile of a key-only service (Meta). The key
+ * is checked for its shape and then presented to the provider once (the
+ * caller's "verify before saving"): a key the provider refuses is not saved,
+ * and the line thrown is the whole story. The account is the numeric id
+ * inside the key, so the same key pasted twice updates one row, and a row
+ * keeps its name, colour and nickname. Returns the profile name.
+ */
+export async function saveApiKey(serviceId: 'meta', input: { key: string; name?: string }): Promise<string> {
+  const key = input.key.trim()
+  const accountId = metaAccountId(key)
+  if (!accountId) throw new Error('not a Meta key: keys start with LLM_')
+  const probe = await probeKey(key).catch((e: Error) => {
+    throw new Error(`Meta could not be reached: ${e.message}`)
+  })
+  if (probe.expired) throw new Error('that key was refused by Meta')
+  const list = vault.profiles(serviceId)
+  const existing = list.find((p) => p.accountId === accountId)
+  const wanted = input.name?.trim()
+  const name = existing?.name ?? (wanted || `Meta key …${key.slice(-4)}`)
+  vault.saveSecret(serviceId, name, metaBlob(key))
+  vault.upsertProfile(serviceId, {
+    ...existing,
+    name,
+    accountId,
+    createdAt: existing?.createdAt ?? Date.now(),
+    static: true,
+    owner: undefined,
+    syncedAt: undefined
+  })
+  clearUsageCache(serviceId, name)
+  hooks().onAccountsChanged?.()
+  return name
+}
+
+/** Whether a string has a Meta key's shape, for a dialog to say so before the probe. */
+export const isMetaKeyShape = (key: string): boolean => META_KEY_RE.test(key.trim())
+
 export function updateProfile(
   serviceId: ServiceId,
   name: string,
@@ -330,6 +369,7 @@ export async function listServices(): Promise<ServiceView[]> {
           duplicate: (counts.get(p.accountId) ?? 0) > 1,
           owner: p.owner,
           static: p.static,
+          ...(a.id === 'meta' ? { kind: 'key' as const } : {}),
           syncedAt: p.syncedAt,
           expiresAt: storedExpiry(a.id, p.name)
         }))

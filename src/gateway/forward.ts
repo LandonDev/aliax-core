@@ -9,6 +9,7 @@ import { pinProfile, pinnedProfile } from '../settings'
 import { hooks } from '../config'
 import { cachedReport, observeLimit } from '../accounts'
 import { blockedWindow, serviceIdOf, tiersFor } from './failover'
+import { META_ORIGIN, metaKeyOf } from '../adapters/meta'
 import { classify429, type Limit } from './limits'
 import type { ServiceId, UsageReport } from '../shared/types'
 import { ownsProfile } from '../sync'
@@ -31,8 +32,13 @@ import * as vault from '../vault'
  * different upstream roots: model turns answer under `/backend-api/codex`,
  * while the plugin and skill catalogue answers under `/backend-api` (both
  * confirmed against the live API). Resolve per path rather than per service.
+ *
+ * A scope whose service is `meta` sends either lane to the Meta Model API:
+ * Claude Code appends `/v1/messages` and Codex `/v1/responses` to the same
+ * origin, so no path is rewritten.
  */
-export function upstreamFor(service: string, path: string): string | null {
+export function upstreamFor(service: string, path: string, serviceId: ServiceId | null = null): string | null {
+  if (serviceId === 'meta') return service === 'claude' || service === 'codex' ? META_ORIGIN : null
   if (service === 'claude') return 'https://api.anthropic.com'
   if (service !== 'codex') return null
   return path.startsWith('/v1/')
@@ -232,9 +238,27 @@ function jwtExpiry(token: string): number {
   }
 }
 
-/** The credential to send for `service`, under `account` when a request names one. */
-export const credentialFor = (service: string, account: string | null = null): Promise<Credential | null> =>
-  service === 'claude' ? claudeCredential(account) : codexCredential(account)
+/** A Meta key, as a bearer: no extra headers, no expiry. Null without a saved key. */
+async function metaCredential(account: string | null): Promise<Credential | null> {
+  const name = account ?? pinnedProfile('meta')
+  if (!name) return null
+  let blob: string | null
+  try {
+    blob = vault.readSecret('meta', name)
+  } catch {
+    return null
+  }
+  const key = blob ? metaKeyOf(blob) : null
+  return key ? { authorization: `Bearer ${key}` } : null
+}
+
+/**
+ * The credential to send for `service`, under `account` when a request names
+ * one. `serviceId` is the vault's service the scope named (`s=meta`); absent,
+ * the lane's own.
+ */
+export const credentialFor = (service: string, account: string | null = null, serviceId: ServiceId | null = null): Promise<Credential | null> =>
+  serviceId === 'meta' ? metaCredential(account) : service === 'claude' ? claudeCredential(account) : codexCredential(account)
 
 /**
  * Everything the forward reads or writes of this machine's accounts. A
@@ -245,8 +269,8 @@ export const credentialFor = (service: string, account: string | null = null): P
  * in-process gateway always has.
  */
 export interface AccountSource {
-  /** The credential for `service` under `account`, or under the pinned account for null; null when none is usable. */
-  credentialFor(service: string, account: string | null): Promise<Credential | null>
+  /** The credential for `service` under `account`, or under the pinned account for null; null when none is usable. `serviceId` is the scope's service when it named one. */
+  credentialFor(service: string, account: string | null, serviceId?: ServiceId | null): Promise<Credential | null>
   /** Whether `name` is a saved account of the service. */
   hasProfile(serviceId: ServiceId, name: string): boolean | Promise<boolean>
   /** The account unscoped traffic spends from. */
@@ -294,10 +318,12 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
 /**
  * A scope segment names the thread a request belongs to and the account it
  * should spend from, so one gateway can serve many threads on many accounts:
- *   /claude/~t=<thread>;a=<account>[;pin=1][;m=<model>]/v1/messages
+ *   /claude/~t=<thread>;a=<account>[;pin=1][;m=<model>][;s=<service>]/v1/messages
  * `pin=1` says the account is an explicit pin (thread, project or workspace)
  * rather than an automatic pick; a pinned thread returns to its pin once that
  * account has room again, an automatic one stays where failover left it.
+ * `s=` names the vault service the account belongs to when it is not the
+ * lane's own (`s=meta`: a Meta key behind the claude or codex wire shape).
  */
 export interface RouteScope {
   thread: string
@@ -305,7 +331,11 @@ export interface RouteScope {
   pin: boolean
   /** The model the thread runs (`m=`), so no body need be parsed for it; a side call's body may still name another. */
   model?: string
+  /** The vault service the account belongs to (`s=`), when it is not the lane's own. */
+  service?: ServiceId
 }
+
+const SERVICE_IDS: ServiceId[] = ['claude-code', 'codex', 'cursor', 'meta']
 
 /** Parse one `~t=…;a=…` path segment; null when it is not a scope. */
 export function parseScope(segment: string): RouteScope | null {
@@ -321,7 +351,23 @@ export function parseScope(segment: string): RouteScope | null {
     }
   }
   if (!fields.t || !fields.a) return null
-  return { thread: fields.t, account: fields.a, pin: fields.pin === '1', ...(fields.m ? { model: fields.m } : {}) }
+  const service = SERVICE_IDS.find((id) => id === fields.s)
+  return {
+    thread: fields.t,
+    account: fields.a,
+    pin: fields.pin === '1',
+    ...(fields.m ? { model: fields.m } : {}),
+    ...(service ? { service } : {})
+  }
+}
+
+/** The path segment of a scope: what `parseScope` reads back, each field encoded. */
+export function scopeSegment(scope: RouteScope): string {
+  const parts = [`t=${encodeURIComponent(scope.thread)}`, `a=${encodeURIComponent(scope.account)}`]
+  if (scope.pin) parts.push('pin=1')
+  if (scope.model) parts.push(`m=${encodeURIComponent(scope.model)}`)
+  if (scope.service) parts.push(`s=${scope.service}`)
+  return `~${parts.join(';')}`
 }
 
 /** Split `/codex/~t=T;a=A/v1/responses` into its service, scope and upstream path. */
@@ -455,14 +501,16 @@ export async function forward(
   input: ForwardInput = {}
 ): Promise<ForwardOutcome> {
   const { service, rest, scope } = splitPath(req.url ?? '/')
-  const upstream = upstreamFor(service, rest)
+  // The scope's service picks the upstream, the credential and the limit
+  // reading; the lane stays the wire shape the CLI speaks.
+  const serviceId = scope?.service ?? serviceIdOf(service)
+  const upstream = upstreamFor(service, rest, scope?.service ?? null)
   if (!upstream) {
     fail(res, 404, `unknown service "${service}"`)
     return { service, status: null }
   }
 
   const body = input.body ?? (['GET', 'HEAD'].includes(req.method ?? 'GET') ? undefined : await readBody(req))
-  const serviceId = serviceIdOf(service)
   const source = on.accounts ?? localAccounts
   const model = input.model !== undefined ? input.model : (scanModel(body) ?? scope?.model ?? null)
   const tried: string[] = []
@@ -486,10 +534,10 @@ export async function forward(
       on.onRouted?.({ service, serviceId, thread: scope.thread, account })
     }
     // A pinned thread goes back to its pin as soon as the pin has room again.
-    if (scope.pin && target !== scope.account && !blockedWindow(await source.report(serviceId, scope.account), tiers, now)) {
+    if (scope.pin && target !== scope.account && !blockedWindow(serviceId, await source.report(serviceId, scope.account), tiers, now)) {
       route(scope.account)
     }
-    const blocked = on.pickNext ? blockedWindow(await source.report(serviceId, target), tiers, now) : null
+    const blocked = on.pickNext ? blockedWindow(serviceId, await source.report(serviceId, target), tiers, now) : null
     if (blocked) {
       const next = await on
         .pickNext!({ service, serviceId, model, limit: blocked, tried: [target], account: target, thread: scope.thread })
@@ -507,7 +555,7 @@ export async function forward(
       return { service, status: null }
     }
     const account = target ?? (serviceId ? await source.pinned(serviceId) : null)
-    const credential = await source.credentialFor(service, target)
+    const credential = await source.credentialFor(service, target, scope?.service ?? null)
     if (!credential) {
       fail(
         res,
@@ -525,6 +573,8 @@ export async function forward(
     headers['authorization'] = credential.authorization
     // The CLI may send its own account scoping; ours must win.
     delete headers['x-api-key']
+    // A Meta key names its own account; the CLI's ChatGPT account means nothing there.
+    if (scope?.service === 'meta') delete headers['chatgpt-account-id']
     for (const [k, v] of Object.entries(credential.extraHeaders ?? {})) headers[k] = v
 
     try {
@@ -548,7 +598,7 @@ export async function forward(
     on.onResponse?.({ service, path: rest, status: upstreamRes.status, headers: upstreamRes.headers, body: rejected, account, model })
 
     if (rejected === undefined || !serviceId || !on.pickNext || !account) break
-    const limit = classify429(service, upstreamRes.headers, rejected, model)
+    const limit = classify429(scope?.service === 'meta' ? 'meta' : service, upstreamRes.headers, rejected, model)
     if (limit.window === 'transient') break
     source.observeLimit(serviceId, account, limit)
     if (tried.length >= MAX_REPLAYS) break

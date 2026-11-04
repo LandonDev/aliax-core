@@ -57,6 +57,16 @@ describe('blob helpers', () => {
     expect(sync.hasRefresh('claude-code', claudeBlob(later))).toBe(true)
   })
 
+  it('a Meta key has no expiry, no refresh token and nothing to strip', () => {
+    core()
+    const blob = JSON.stringify({ key: 'LLM_1607_abc' })
+    expect(sync.accessExpiry('meta', blob)).toBeNull()
+    expect(sync.hasRefresh('meta', blob)).toBe(false)
+    expect(sync.stripRefresh('meta', blob)).toBe(blob)
+    expect(sync.refreshFingerprint('meta', blob)).toBeNull()
+    expect(sync.forTransfer('meta', blob)).toBe(blob)
+  })
+
   it('a transfer never carries the desktop app session', () => {
     core()
     const out = sync.forTransfer('claude-code', claudeBlob(later, 'R', { appSession: [{ name: 'sessionKey' }] }))
@@ -106,6 +116,27 @@ describe('exportAccount', () => {
     const out = sync.exportAccount('claude-code', 's', 'handoff', 'env_box')
     expect(out).toMatchObject({ mode: 'access', profile: { static: true, owner: null }, expiresAt: later })
     expect(sync.isStaticBlob(out.blob)).toBe(true)
+  })
+})
+
+describe('a Meta key across hosts', () => {
+  it('exports as a static access copy with no owner, lands under the peer policy only where the key is on file, and never claims a handoff', () => {
+    core({ environmentId: 'env_mac' })
+    vault.upsertProfile('meta', { name: 'k', accountId: '1607', createdAt: 1, static: true })
+    vault.saveSecret('meta', 'k', JSON.stringify({ key: 'LLM_1607_abc' }))
+    const out = sync.exportAccount('meta', 'k', 'handoff', 'env_box')
+    expect(out).toMatchObject({ service: 'meta', mode: 'access', profile: { name: 'k', accountId: '1607', static: true, owner: null }, expiresAt: null })
+    expect(JSON.parse(out.blob)).toEqual({ key: 'LLM_1607_abc' })
+
+    core({ environmentId: 'env_box' })
+    expect(sync.applyTransfer(out, 'env_mac', 'peer')).toEqual({ ok: false, reason: 'unknown-account' })
+    expect(sync.applyTransfer(out, 'env_mac', 'admin')).toMatchObject({ ok: true, name: 'k', saved: true, owner: null, expiresAt: null, refreshFingerprint: null })
+    expect(vault.profiles('meta')).toMatchObject([{ name: 'k', accountId: '1607', static: true }])
+    expect(vault.readSecret('meta', 'k')).toBe(out.blob)
+    expect(sync.ownsProfile(vault.profiles('meta')[0])).toBe(false)
+    // The same copy again under the peer policy is now a known account; nothing hands off.
+    expect(sync.applyTransfer(out, 'env_mac', 'peer')).toMatchObject({ ok: true, owner: null })
+    expect(sync.claimHandoff('meta', 'k', 'env_mac')).toBe(false)
   })
 })
 

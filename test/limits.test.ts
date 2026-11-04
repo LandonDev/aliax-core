@@ -76,6 +76,17 @@ describe('classify429 scoped claims', () => {
   })
 })
 
+describe('classify429 meta', () => {
+  it('is transient, lifting when Retry-After says; no window is ever charged', () => {
+    const now = Date.now()
+    const out = classify429('meta', new Headers({ 'retry-after': '30' }), '{"error":{"message":"rate limited"}}', 'muse-wonder-1.0')
+    expect(out.window).toBe('transient')
+    expect(out.resetsAt).toBeGreaterThanOrEqual(now + 30_000)
+    expect(out.resetsAt).toBeLessThan(now + 31_000)
+    expect(classify429('meta', new Headers(), '', 'muse-wonder-1.0')).toEqual({ window: 'transient' })
+  })
+})
+
 describe('codexSnapshotToWindows', () => {
   it('converts the app-server snapshot in either key style', () => {
     const v2 = codexSnapshotToWindows({

@@ -1,4 +1,4 @@
-export type ServiceId = 'claude-code' | 'codex' | 'cursor'
+export type ServiceId = 'claude-code' | 'codex' | 'cursor' | 'meta'
 
 export interface ProfileView {
   name: string
@@ -17,6 +17,8 @@ export interface ProfileView {
   owner?: string
   /** A long-lived bearer (`claude setup-token`): nothing refreshes it, it lapses at `expiresAt`. */
   static?: boolean
+  /** An API key (the Meta Model API): static, never expires on its own, no owner. */
+  kind?: 'key'
   /** When the stored access token lapses, when the credentials say. */
   expiresAt?: number
   /** When a copy was last exchanged with another environment. */
