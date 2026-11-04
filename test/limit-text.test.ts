@@ -116,3 +116,12 @@ describe('classifyLimitText: Codex', () => {
     expect(classifyLimitText('codex', 'The model produced a limited response.')).toBeNull()
   })
 })
+
+describe('classifyLimitText: Muse', () => {
+  it("reads the muse driver's quota row as the 5-hour window, a weekly limit as weekly, the rest as nothing", () => {
+    expect(classifyLimitText('muse', 'quota: tierLimit, resets in 1 h 30 min (usage limit reached)')).toEqual({ window: '5h' })
+    expect(classifyLimitText('muse', 'weekly limit reached')).toEqual({ window: 'weekly' })
+    expect(classifyLimitText('muse', 'the model answered with an error')).toBeNull()
+    expect(classifyLimitText('muse', 'too many requests')).toEqual({ window: 'transient' })
+  })
+})

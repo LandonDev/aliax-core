@@ -18,6 +18,8 @@ export function tiersFor(serviceId: ServiceId, model: string | null | undefined)
   if (serviceId === 'codex') return ['5h', 'week']
   // Pay as you go: no window to spend, only a key that works or does not.
   if (serviceId === 'meta') return []
+  // The subscription's two blocks, as `usage/changed` names them (never `week`: that is Codex's).
+  if (serviceId === 'muse-code') return ['5h', 'Weekly']
   const tiers = ['5h', 'Weekly']
   const cap = scopedCapOf(serviceId, model)
   if (cap) tiers.push(cap)

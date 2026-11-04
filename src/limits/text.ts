@@ -23,7 +23,7 @@
  */
 import type { LimitWindow } from '../gateway/limits'
 
-export type TextProvider = 'claude' | 'codex'
+export type TextProvider = 'claude' | 'codex' | 'muse'
 
 export interface TextLimit {
   window: LimitWindow
@@ -45,6 +45,13 @@ const CODEX: Rule[] = [
   [/usage limit for (?:the )?(?:5|five)[- ]?h/i, () => '5h'],
   [/usage limit|usage_limit_reached/i, () => '5h'],
   [/out of credits|quota exceeded|quota_exceeded|usage_not_included|insufficient_quota/i, () => 'credits']
+]
+
+/** The muse driver's own row words for a `turn/completed` quota error, and the CLI's. */
+const MUSE: Rule[] = [
+  [/quota: tierLimit/i, () => '5h'],
+  [/weekly limit/i, () => 'weekly'],
+  [/usage limit|usage_limited|tier limit/i, () => '5h']
 ]
 
 const cap = (s: string): string => s[0].toUpperCase() + s.slice(1).toLowerCase()
@@ -88,7 +95,7 @@ export function classifyLimitText(provider: TextProvider, message: string): Text
     const summary = summaryLimit(text)
     if (summary) return { window: summary }
   }
-  for (const [re, window] of provider === 'claude' ? CLAUDE : CODEX) {
+  for (const [re, window] of provider === 'claude' ? CLAUDE : provider === 'muse' ? MUSE : CODEX) {
     const m = text.match(re)
     if (m) return { window: window(m) }
   }

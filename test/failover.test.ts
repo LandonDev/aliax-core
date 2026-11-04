@@ -16,6 +16,7 @@ describe('tiers', () => {
     expect(tiersFor('claude-code', 'claude-fable-5-1')).toEqual(['5h', 'Weekly', 'Fable'])
     expect(tiersFor('claude-code', null)).toEqual(['5h', 'Weekly'])
     expect(tiersFor('codex', 'gpt-6-astra')).toEqual(['5h', 'week'])
+    expect(tiersFor('muse-code', 'muse-wonder-full-1.0')).toEqual(['5h', 'Weekly'])
   })
   it('a Meta key spends no window: pay as you go, blocked only by a revoked key', () => {
     expect(tiersFor('meta', 'muse-wonder-1.0')).toEqual([])

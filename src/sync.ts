@@ -66,8 +66,9 @@ export function accessExpiry(serviceId: ServiceId, blob: string): number | null 
     return typeof exp === 'number' ? exp : null
   }
   if (serviceId === 'codex') return jwtExpiry(parsed.tokens?.access_token)
-  // A Meta key has no expiry of its own: it lasts until the dashboard revokes it.
-  if (serviceId === 'meta') return null
+  // A Meta key has no expiry of its own: it lasts until the dashboard revokes
+  // it; a Muse Code login carries none either (static until `muse logout`).
+  if (serviceId === 'meta' || serviceId === 'muse-code') return null
   return jwtExpiry(parsed.access)
 }
 
@@ -77,7 +78,7 @@ export function hasRefresh(serviceId: ServiceId, blob: string): boolean {
   if (!parsed) return false
   if (serviceId === 'claude-code') return typeof claudeTokens(parsed)?.refreshToken === 'string'
   if (serviceId === 'codex') return typeof parsed.tokens?.refresh_token === 'string'
-  if (serviceId === 'meta') return false
+  if (serviceId === 'meta' || serviceId === 'muse-code') return false
   return typeof parsed.refresh === 'string'
 }
 
@@ -94,7 +95,7 @@ export function stripRefresh(serviceId: ServiceId, blob: string): string {
     }
   } else if (serviceId === 'codex') {
     if (parsed.tokens && typeof parsed.tokens === 'object') delete parsed.tokens.refresh_token
-  } else if (serviceId === 'meta') {
+  } else if (serviceId === 'meta' || serviceId === 'muse-code') {
     return blob
   } else {
     delete parsed.refresh
@@ -105,7 +106,7 @@ export function stripRefresh(serviceId: ServiceId, blob: string): string {
 const refreshTokenOf = (serviceId: ServiceId, blob: string): string | null => {
   const parsed = parse(blob)
   if (!parsed) return null
-  if (serviceId === 'meta') return null
+  if (serviceId === 'meta' || serviceId === 'muse-code') return null
   const token =
     serviceId === 'claude-code' ? claudeTokens(parsed)?.refreshToken : serviceId === 'codex' ? parsed.tokens?.refresh_token : parsed.refresh
   return typeof token === 'string' ? token : null

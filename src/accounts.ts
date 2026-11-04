@@ -14,6 +14,7 @@ import { enabledTargets } from './settings'
 import { refreshFor } from './refresh'
 import { accessExpiry, hasRefresh, ownsProfile } from './sync'
 import { META_KEY_RE, metaAccountId, metaBlob, probeKey } from './adapters/meta'
+import { museConfigDir } from './adapters/muse'
 import * as vault from './vault'
 
 export const extra =
@@ -28,7 +29,12 @@ export const extra =
  * CLI writes it, so a saved copy never falls behind and trips that detection.
  */
 export function watchLiveCredentials(): void {
-  const dir = join(homedir(), '.codex')
+  watchAuthJson(join(homedir(), '.codex'), 'codex')
+  // Muse Code's login (`muse login` / `muse logout`) rewrites its auth.json whole.
+  watchAuthJson(museConfigDir(), 'muse-code')
+}
+
+function watchAuthJson(dir: string, serviceId: ServiceId): void {
   if (!existsSync(dir)) return
   let timer: NodeJS.Timeout | null = null
   watch(dir, (_event, filename) => {
@@ -36,7 +42,7 @@ export function watchLiveCredentials(): void {
     if (timer) clearTimeout(timer)
     // Debounced: switches and logins rewrite the file several times in a burst.
     timer = setTimeout(() => {
-      recaptureLive(adapter('codex')).catch(() => {})
+      recaptureLive(adapter(serviceId)).catch(() => {})
     }, 1500)
   })
 }

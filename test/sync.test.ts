@@ -67,6 +67,16 @@ describe('blob helpers', () => {
     expect(sync.forTransfer('meta', blob)).toBe(blob)
   })
 
+  it('a Muse Code login is static too: no expiry, no refresh, nothing stripped', () => {
+    core()
+    const blob = JSON.stringify({ schema_version: 1, providers: { meta: { access_token: 'dca:x', api_key: 'LLM|1|k', mechanism: 'oauth', user_email: 'a@x' } } })
+    expect(sync.accessExpiry('muse-code', blob)).toBeNull()
+    expect(sync.hasRefresh('muse-code', blob)).toBe(false)
+    expect(sync.stripRefresh('muse-code', blob)).toBe(blob)
+    expect(sync.refreshFingerprint('muse-code', blob)).toBeNull()
+    expect(sync.forTransfer('muse-code', blob)).toBe(blob)
+  })
+
   it('a transfer never carries the desktop app session', () => {
     core()
     const out = sync.forTransfer('claude-code', claudeBlob(later, 'R', { appSession: [{ name: 'sessionKey' }] }))
