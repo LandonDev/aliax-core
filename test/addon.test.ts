@@ -335,6 +335,16 @@ describe('refreshAddon', () => {
     expect(oauthOf(vault.readSecret(ADDON_SERVICE, 'ad_a'))).toMatchObject({ accessToken: 'NEWER', expiresAt: far })
   })
 
+  it('a shorter-lived answer is saved all the same: the refresh token it replaced is spent', async () => {
+    const fetch = tokenServer(() => jsonResponse({ access_token: 'AT2', refresh_token: 'RT2', expires_in: 60 }))
+    core({ fetch, environmentId: 'env_box' })
+    ownedHere(grant({ expiresAt: Date.now() + 10 * HOUR }))
+    const out = await refreshAddon('ad_a', { force: true })
+    expect(out.ok).toBe(true)
+    expect(oauthOf(vault.readSecret(ADDON_SERVICE, 'ad_a'))).toMatchObject({ accessToken: 'AT2', refreshToken: 'RT2' })
+    expect(oauthOf(vault.readSecret(ADDON_SERVICE, 'ad_a')).expiresAt).toBeLessThan(Date.now() + 2 * 60_000)
+  })
+
   it('a host that lost the grant mid-refresh keeps no refresh token', async () => {
     const fetch = tokenServer(async () => {
       const p = vault.profiles(ADDON_SERVICE)[0]

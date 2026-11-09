@@ -167,7 +167,9 @@ export type AddonRefresh =
  * grant's token endpoint, form-encoded. After the answer the profile and the
  * blob are read again: a profile that went meanwhile saves nothing (a clear
  * ran), the new tokens go onto the LATEST blob's oauth section (values saved
- * meanwhile stay), a save never goes backwards by the stored expiry, and it
+ * meanwhile stay), a save never goes backwards over a token saved during
+ * the request (a shorter-lived answer is still saved: its refresh token is
+ * the only one left), and it
  * goes through saveRefreshed, so a host that lost the grant mid-refresh keeps
  * no refresh token. No role gate: only temp-code knows add-on grants, and
  * ownership is the one rule.
@@ -208,8 +210,11 @@ export function refreshAddon(name: string, opts: { force?: boolean; minValidMs?:
     const latestGrant = latest ? addonGrantOf(latest) : null
     if (!latestProfile || !latest || !latestGrant) return { ok: false, reason: 'no-grant' }
     const nextExpiry = typeof data.expires_in === 'number' && data.expires_in > 0 ? Date.now() + data.expires_in * 1000 : undefined
+    // Never backwards, but only over a token saved during the request: the refresh token just
+    // presented is spent, so the pair that came back is the grant even when it lapses sooner.
     const latestExpiry = latestGrant.oauth?.expiresAt
-    if (typeof latestExpiry === 'number' && nextExpiry !== undefined && latestExpiry > nextExpiry) return { ok: true, blob: latest }
+    const savedMeanwhile = latestGrant.oauth?.refreshToken !== refreshToken || latestGrant.oauth?.accessToken !== grant.oauth.accessToken
+    if (savedMeanwhile && typeof latestExpiry === 'number' && nextExpiry !== undefined && latestExpiry > nextExpiry) return { ok: true, blob: latest }
     const oauth = {
       ...(latestGrant.oauth ?? grant.oauth),
       accessToken: data.access_token,
