@@ -15,6 +15,7 @@ import { refreshFor } from './refresh'
 import { accessExpiry, hasRefresh, ownsProfile } from './sync'
 import { META_KEY_RE, metaAccountId, metaBlob, probeKey } from './adapters/meta'
 import { museConfigDir } from './adapters/muse'
+import { ADDON_SERVICE, addonGrantOf } from './adapters/addon'
 import * as vault from './vault'
 
 export const extra =
@@ -267,6 +268,39 @@ export async function saveApiKey(serviceId: 'meta', input: { key: string; name?:
   return name
 }
 
+/**
+ * Save an add-on grant on this host (temp-code's add-on registry). The
+ * profile name and account are the add-on's id, the nickname its name. The
+ * grant is static exactly when the blob has no `oauth` section. `signedIn`
+ * (a sign-in that just completed here) makes this machine the owner (owner
+ * unset, syncedAt cleared), whoever owned it before; otherwise the row keeps
+ * its owner. Saved with origin `local`, so a syncing host sends it on. No
+ * onAccountsChanged: no account page lists the service. Returns the name.
+ */
+export function saveAddonGrant(input: { addonId: string; nickname: string; blob: string; signedIn?: boolean }): string {
+  const grant = addonGrantOf(input.blob)
+  if (!grant || grant.addonId !== input.addonId) throw new Error(`not a grant of the add-on ${input.addonId}`)
+  const name = input.addonId
+  const existing = vault.profiles(ADDON_SERVICE).find((p) => p.name === name)
+  const isStatic = !grant.oauth
+  vault.saveSecret(ADDON_SERVICE, name, input.blob)
+  const row: vault.StoredProfile = {
+    ...existing,
+    name,
+    accountId: input.addonId,
+    nickname: input.nickname,
+    createdAt: existing?.createdAt ?? Date.now(),
+    static: isStatic
+  }
+  if (isStatic || input.signedIn) {
+    delete row.owner
+    delete row.syncedAt
+    delete row.releasedAt
+  }
+  vault.upsertProfile(ADDON_SERVICE, row)
+  return name
+}
+
 /** Whether a string has a Meta key's shape, for a dialog to say so before the probe. */
 export const isMetaKeyShape = (key: string): boolean => META_KEY_RE.test(key.trim())
 
@@ -318,7 +352,7 @@ function storedExpiry(serviceId: ServiceId, name: string): number | undefined {
 
 export async function listServices(): Promise<ServiceView[]> {
   return Promise.all(
-    adapters.map(async (a) => {
+    adapters.filter((a) => !a.internal).map(async (a) => {
       const installed = a.detect()
       const profiles = vault.profiles(a.id)
       const active = installed ? await activeProfileName(a) : null

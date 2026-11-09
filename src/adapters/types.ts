@@ -56,6 +56,8 @@ export interface Adapter {
   billingUrl?: string
   /** Whether Aliax can start a sign-in flow itself (vs. only saving an existing login). */
   supportsLogin: boolean
+  /** A service the host app manages itself (temp-code's add-on grants): listServices leaves it out, so no account page lists it. */
+  internal?: boolean
   /** The optional places a switch can propagate to, user-toggleable in settings. */
   targets: { id: string; label: string }[]
   detect(): boolean

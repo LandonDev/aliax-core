@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { addonGrantOf } from './adapters/addon'
 import { decodeJwtPayload } from './adapters/types'
 import { environmentId } from './config'
 import { acquire } from './lock'
@@ -69,6 +70,8 @@ export function accessExpiry(serviceId: ServiceId, blob: string): number | null 
   // A Meta key has no expiry of its own: it lasts until the dashboard revokes
   // it; a Muse Code login carries none either (static until `muse logout`).
   if (serviceId === 'meta' || serviceId === 'muse-code') return null
+  // An add-on grant says when its access token lapses; typed values never do.
+  if (serviceId === 'addon') return addonGrantOf(blob)?.oauth?.expiresAt ?? null
   return jwtExpiry(parsed.access)
 }
 
@@ -79,6 +82,7 @@ export function hasRefresh(serviceId: ServiceId, blob: string): boolean {
   if (serviceId === 'claude-code') return typeof claudeTokens(parsed)?.refreshToken === 'string'
   if (serviceId === 'codex') return typeof parsed.tokens?.refresh_token === 'string'
   if (serviceId === 'meta' || serviceId === 'muse-code') return false
+  if (serviceId === 'addon') return typeof addonGrantOf(blob)?.oauth?.refreshToken === 'string'
   return typeof parsed.refresh === 'string'
 }
 
@@ -97,6 +101,10 @@ export function stripRefresh(serviceId: ServiceId, blob: string): string {
     if (parsed.tokens && typeof parsed.tokens === 'object') delete parsed.tokens.refresh_token
   } else if (serviceId === 'meta' || serviceId === 'muse-code') {
     return blob
+  } else if (serviceId === 'addon') {
+    // The client, its port, the URLs and the typed values stay: a sign-in
+    // again on the Mac reuses the registered client and its redirect port.
+    if (parsed.oauth && typeof parsed.oauth === 'object') delete parsed.oauth.refreshToken
   } else {
     delete parsed.refresh
   }
@@ -107,6 +115,7 @@ const refreshTokenOf = (serviceId: ServiceId, blob: string): string | null => {
   const parsed = parse(blob)
   if (!parsed) return null
   if (serviceId === 'meta' || serviceId === 'muse-code') return null
+  if (serviceId === 'addon') return addonGrantOf(blob)?.oauth?.refreshToken ?? null
   const token =
     serviceId === 'claude-code' ? claudeTokens(parsed)?.refreshToken : serviceId === 'codex' ? parsed.tokens?.refresh_token : parsed.refresh
   return typeof token === 'string' ? token : null
@@ -320,9 +329,16 @@ export function applyTransfer(t: Transfer, from: string, policy: ApplyPolicy = '
   }
   if (t.profile.static) {
     if (policy === 'peer' && !existing?.static) return { ok: false, reason: 'unknown-account' }
+    // An add-on grant with a sign-in is never made static by a copy of its
+    // typed values alone: every host that holds such a copy pushes it, and
+    // the land would mark the row static even when the blob stays. Leaving
+    // OAuth goes through a removal (a tombstone) first.
+    if (t.service === 'addon' && existing && !existing.static) return { ok: false, reason: 'owner-mismatch' }
     return land(t.blob, null, true)
   }
-  if (existing?.static) return { ok: false, reason: 'static' }
+  // An add-on whose values were saved before its first sign-in has a static
+  // row on every host; the sign-in (a handoff or an access copy) replaces it.
+  if (existing?.static && t.service !== 'addon') return { ok: false, reason: 'static' }
   if (t.mode === 'handoff') {
     if (t.profile.owner !== me) return { ok: false, reason: 'not-for-us' }
     if (!hasRefresh(t.service, t.blob)) return { ok: false, reason: 'bad-blob' }

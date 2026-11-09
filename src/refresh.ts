@@ -1,3 +1,4 @@
+import { addonGrantOf } from './adapters/addon'
 import { refreshAuth as refreshCodexGrant } from './adapters/codex'
 import type { RefreshBlob } from './adapters/types'
 import { fetch, hooks, role } from './config'
@@ -147,6 +148,77 @@ export function refreshCodex(name: string, blob: string): Promise<string | null>
     const nextAt = accessExpiry('codex', next)
     if (latest && latestAt !== null && nextAt !== null && latestAt > nextAt) return latest
     return saveRefreshed('codex', name, next)
+  })
+}
+
+export type AddonRefresh =
+  | { ok: true; blob: string }
+  | { ok: false; reason: 'no-grant' | 'static' | 'no-refresh' | 'refused' | 'network' | 'owner-unreachable' }
+
+/**
+ * Renew one add-on grant's access token (temp-code's add-on OAuth), under
+ * `once`, the profile lock a handoff also holds. The vault is re-read under
+ * the lock; unless `force`, a stored token with more than `minValidMs` left
+ * (default EXPIRY_MARGIN_MS) is returned as it is, on the owner and on a
+ * copy alike (`force` on a copy always asks the owner, so a token the server
+ * just refused is never handed back from this vault). A static profile has
+ * nothing to renew. A copy another environment owns asks that owner
+ * (hooks().askOwner). Otherwise the stored refresh token is POSTed to the
+ * grant's token endpoint, form-encoded. After the answer the profile and the
+ * blob are read again: a profile that went meanwhile saves nothing (a clear
+ * ran), the new tokens go onto the LATEST blob's oauth section (values saved
+ * meanwhile stay), a save never goes backwards by the stored expiry, and it
+ * goes through saveRefreshed, so a host that lost the grant mid-refresh keeps
+ * no refresh token. No role gate: only temp-code knows add-on grants, and
+ * ownership is the one rule.
+ */
+export function refreshAddon(name: string, opts: { force?: boolean; minValidMs?: number } = {}): Promise<AddonRefresh> {
+  return once('addon', name, async (): Promise<AddonRefresh> => {
+    const profile = profileOf('addon', name)
+    const stored = storedBlob('addon', name)
+    if (!profile || !stored) return { ok: false, reason: 'no-grant' }
+    if (profile.static) return { ok: false, reason: 'static' }
+    const grant = addonGrantOf(stored)
+    if (!grant) return { ok: false, reason: 'no-grant' }
+    if (!grant.oauth) return { ok: false, reason: 'static' }
+    const minValidMs = opts.minValidMs ?? EXPIRY_MARGIN_MS
+    const expiresAt = grant.oauth.expiresAt
+    if (!opts.force && grant.oauth.accessToken && typeof expiresAt === 'number' && expiresAt - Date.now() > minValidMs) return { ok: true, blob: stored }
+    if (!ownsProfile(profile)) {
+      const blob = await askOwner('addon', name, profile.owner ?? '')
+      return blob ? { ok: true, blob } : { ok: false, reason: 'owner-unreachable' }
+    }
+    const refreshToken = grant.oauth.refreshToken
+    if (!refreshToken) return { ok: false, reason: 'no-refresh' }
+    const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: grant.oauth.clientId })
+    if (grant.oauth.clientSecret) body.set('client_secret', grant.oauth.clientSecret)
+    if (grant.oauth.resource) body.set('resource', grant.oauth.resource)
+    const res = await fetch(grant.oauth.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: body.toString()
+    }).catch(() => null)
+    if (!res) return { ok: false, reason: 'network' }
+    if (res.status === 400 || res.status === 401) return { ok: false, reason: 'refused' }
+    if (!res.ok) return { ok: false, reason: 'network' }
+    const data = (await res.json().catch(() => null)) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown } | null
+    if (!data || typeof data.access_token !== 'string' || !data.access_token) return { ok: false, reason: 'network' }
+    const latestProfile = profileOf('addon', name)
+    const latest = storedBlob('addon', name)
+    const latestGrant = latest ? addonGrantOf(latest) : null
+    if (!latestProfile || !latest || !latestGrant) return { ok: false, reason: 'no-grant' }
+    const nextExpiry = typeof data.expires_in === 'number' && data.expires_in > 0 ? Date.now() + data.expires_in * 1000 : undefined
+    const latestExpiry = latestGrant.oauth?.expiresAt
+    if (typeof latestExpiry === 'number' && nextExpiry !== undefined && latestExpiry > nextExpiry) return { ok: true, blob: latest }
+    const oauth = {
+      ...(latestGrant.oauth ?? grant.oauth),
+      accessToken: data.access_token,
+      refreshToken: typeof data.refresh_token === 'string' && data.refresh_token ? data.refresh_token : refreshToken
+    }
+    if (nextExpiry !== undefined) oauth.expiresAt = nextExpiry
+    else delete oauth.expiresAt
+    if (typeof data.scope === 'string' && data.scope) oauth.scope = data.scope
+    return { ok: true, blob: saveRefreshed('addon', name, JSON.stringify({ ...latestGrant, oauth })) }
   })
 }
 

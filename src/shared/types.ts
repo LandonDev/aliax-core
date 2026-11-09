@@ -1,4 +1,4 @@
-export type ServiceId = 'claude-code' | 'codex' | 'cursor' | 'meta' | 'muse-code'
+export type ServiceId = 'claude-code' | 'codex' | 'cursor' | 'meta' | 'muse-code' | 'addon'
 
 export interface ProfileView {
   name: string
