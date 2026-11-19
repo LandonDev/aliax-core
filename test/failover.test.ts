@@ -240,6 +240,10 @@ describe('classify429', () => {
     ).toEqual({ window: 'weekly', resetsAt: 1_800_000_000_000, claim: 'secondary' })
     expect(classify429('codex', h({}), JSON.stringify({ error: { code: 'usage_limit_reached', message: 'You have hit your usage limit', resets_in_seconds: 60 } })).window).toBe('5h')
     expect(classify429('codex', h({}), JSON.stringify({ error: { type: 'usage_limit_reached', message: 'weekly limit reached' } })).window).toBe('weekly')
+    // A promax plan's only window is weekly: the 429 names its length and no type.
+    expect(classify429('codex', h({}), JSON.stringify({ error: { type: 'usage_limit_reached', message: 'The usage limit has been reached', limit_window_minutes: 10080, resets_at: 1795331463 } })).window).toBe('weekly')
+    expect(classify429('codex', h({}), JSON.stringify({ error: { type: 'usage_limit_reached', rate_limit_reached_type: 'primary', limit_window_minutes: 10080 } })).window).toBe('weekly')
+    expect(classify429('codex', h({}), JSON.stringify({ error: { type: 'usage_limit_reached', rate_limit_reached_type: 'secondary', limit_window_minutes: 300 } })).window).toBe('5h')
     expect(classify429('codex', h({}), JSON.stringify({ error: { code: 'usage_not_included', message: 'add credits' } })).window).toBe('credits')
     expect(classify429('codex', h({}), JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'slow down' } })).window).toBe('transient')
     expect(classify429('codex', h({}), 'not json').window).toBe('transient')

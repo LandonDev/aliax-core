@@ -203,6 +203,7 @@ interface CodexError {
   code?: string
   message?: string
   rate_limit_reached_type?: string
+  limit_window_minutes?: number
   resets_at?: number
   resets_in_seconds?: number
 }
@@ -228,7 +229,11 @@ function classifyCodex(body: string): Limit {
         : undefined
   if (kind === 'usage_limit_reached' || code === 'usage_limit_reached') {
     const which = error.rate_limit_reached_type
-    const window: LimitWindow = which === 'secondary' || (!which && /week/i.test(message)) ? 'weekly' : '5h'
+    // The window's own length wins: a plan whose primary window is weekly
+    // says limit_window_minutes 10080 and no type at all.
+    const minutes = error.limit_window_minutes
+    const weekly = typeof minutes === 'number' && minutes > 0 ? minutes >= 1440 : which === 'secondary' || (!which && /week/i.test(message))
+    const window: LimitWindow = weekly ? 'weekly' : '5h'
     return { window, resetsAt, claim: which }
   }
   if (/quota_exceeded|usage_not_included|insufficient_quota|credits/i.test(`${kind} ${code} ${message}`)) {

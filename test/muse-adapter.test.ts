@@ -84,7 +84,10 @@ describe('the muse-code adapter', () => {
   it('detects an install by the config dir or the binary', () => {
     const dir = scratch()
     const savedPath = process.env.PATH
+    const savedHome = process.env.HOME
     try {
+      // detect() also looks in ~/.local/bin, so the real home must not answer.
+      process.env.HOME = dir
       process.env.PATH = join(dir, 'nowhere')
       expect(muse.detect()).toBe(false)
       mkdirSync(join(dir, 'bin'))
@@ -96,6 +99,7 @@ describe('the muse-code adapter', () => {
       expect(muse.detect()).toBe(true)
     } finally {
       process.env.PATH = savedPath
+      process.env.HOME = savedHome
     }
   })
 
