@@ -418,6 +418,9 @@ export interface Handoff {
  * full grant, and hand back the two ways out. The caller sends the transfer,
  * compares the answer's fingerprint with `fingerprint`, and commits only on
  * a match. Nothing may be left open: a pending release times out to abort.
+ * A host whose CLI may be signed in with this grant compares the adapter's
+ * liveFingerprint() first and withholds the handoff on a match or a throw:
+ * only null means the CLI here holds no grant.
  */
 export async function beginHandoff(serviceId: ServiceId, name: string, to: string): Promise<Handoff> {
   const release = await acquire(serviceId, name)

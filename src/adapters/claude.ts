@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { PlanInfo, UsageWindow } from '../shared/types'
 import { isRunning, launchApp, quitApp } from '../apps'
+import { credentials } from '../credentials'
 import { readPassword, writePassword } from '../keychain'
 import { readCookies, writeCookies, type PlainCookie } from '../chromium-cookies'
 import {
@@ -518,14 +519,17 @@ export const claude: Adapter = {
     return (await liveCliIdentity())?.accountId ?? null
   },
 
+  /**
+   * Null only when the store says nothing is there (no Keychain item, no
+   * credentials file) or the stored JSON holds no refresh token; a store that
+   * cannot be read, or text that does not parse, throws (see Adapter.liveFingerprint).
+   */
   async liveFingerprint() {
-    try {
-      const tokens = JSON.parse(await readPassword(KEYCHAIN_SERVICE))?.claudeAiOauth
-      if (typeof tokens?.refreshToken !== 'string') return null
-      return createHash('sha256').update(tokens.refreshToken).digest('hex')
-    } catch {
-      return null
-    }
+    const text = await credentials().read(KEYCHAIN_SERVICE)
+    if (text === null) return null
+    const tokens = (JSON.parse(text) as { claudeAiOauth?: { refreshToken?: unknown } } | null)?.claudeAiOauth
+    if (typeof tokens?.refreshToken !== 'string') return null
+    return createHash('sha256').update(tokens.refreshToken).digest('hex')
   },
 
   /** The CLI's OAuth token and the desktop app's claude.ai session are separate logins. */

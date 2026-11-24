@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -38,7 +38,16 @@ describe('the Codex grant lineage', () => {
     expect(codex.fingerprintOf!(authJson(null))).toBeNull()
     expect(codex.fingerprintOf!(JSON.stringify({ OPENAI_API_KEY: 'k' }))).toBeNull()
     expect(codex.fingerprintOf!('nope')).toBeNull()
-    writeFileSync(join(home, 'auth.json'), 'not json')
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'k' }))
     expect(await codex.liveFingerprint!()).toBeNull()
+  })
+
+  it('the live fingerprint is null only for no auth.json; a file it cannot read or parse throws (security review F26)', async () => {
+    expect(await codex.liveFingerprint!()).toBeNull()
+    writeFileSync(join(home, 'auth.json'), 'not json')
+    await expect(codex.liveFingerprint!()).rejects.toThrow()
+    rmSync(join(home, 'auth.json'))
+    mkdirSync(join(home, 'auth.json'))
+    await expect(codex.liveFingerprint!()).rejects.toThrow(/EISDIR/)
   })
 })

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -151,6 +151,39 @@ describe('platform selection and the legacy calls', () => {
     await expect(readPassword(CLAUDE_CREDENTIALS_SERVICE)).resolves.toBe(BLOB)
     useCredentialBackend(null)
     expect(credentials().kind).toBe(credentialBackendFor().kind)
+  })
+})
+
+describe('the claude live fingerprint tells no login from unknown (security review F26)', () => {
+  const fp = createHash('sha256').update('ref').digest('hex')
+
+  it('file backend: missing is null, no refresh token is null, unparsable or unreadable throws', async () => {
+    const b = fileBackend({ home: tempHome(), env: {} })
+    useCredentialBackend(b)
+    await expect(claude.liveFingerprint!()).resolves.toBeNull()
+    await b.write(CLAUDE_CREDENTIALS_SERVICE, 'me', JSON.stringify({ claudeAiOauth: { accessToken: 'acc' } }))
+    await expect(claude.liveFingerprint!()).resolves.toBeNull()
+    await b.write(CLAUDE_CREDENTIALS_SERVICE, 'me', JSON.stringify({ other: 1 }))
+    await expect(claude.liveFingerprint!()).resolves.toBeNull()
+    await b.write(CLAUDE_CREDENTIALS_SERVICE, 'me', BLOB)
+    await expect(claude.liveFingerprint!()).resolves.toBe(fp)
+    writeFileSync(claudeFile(), '{"claudeAiOauth": {"refreshTo')
+    await expect(claude.liveFingerprint!()).rejects.toThrow()
+    rmSync(claudeFile())
+    mkdirSync(claudeFile())
+    await expect(claude.liveFingerprint!()).rejects.toThrow(/EISDIR/)
+  })
+
+  it('Keychain: no item is null, any other Keychain failure throws', async () => {
+    const fail = (code: number) => async () => {
+      throw Object.assign(new Error(`security exited ${code}`), { code })
+    }
+    useCredentialBackend(keychainBackend(fail(44)))
+    await expect(claude.liveFingerprint!()).resolves.toBeNull()
+    useCredentialBackend(keychainBackend(fail(51)))
+    await expect(claude.liveFingerprint!()).rejects.toThrow(/exited 51/)
+    useCredentialBackend(keychainBackend(async () => ({ stdout: `${BLOB}\n` })))
+    await expect(claude.liveFingerprint!()).resolves.toBe(fp)
   })
 })
 

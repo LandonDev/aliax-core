@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { adapterForTest, observeWindows, usageOf } from '../src/accounts'
@@ -55,6 +55,19 @@ describe('the muse-code adapter', () => {
     expect(muse.supportsLogin).toBe(true)
     expect(muse.targets).toEqual([])
     expect(adapterForTest('muse-code')).toBe(muse)
+  })
+
+  it('the live fingerprint is null only for no file or a logged-out one; an unreadable or unparsable file throws', async () => {
+    scratch()
+    expect(await muse.liveFingerprint!()).toBeNull()
+    mkdirSync(museConfigDir(), { recursive: true })
+    writeFileSync(museAuthPath(), MUSE_LOGGED_OUT)
+    expect(await muse.liveFingerprint!()).toBeNull()
+    writeFileSync(museAuthPath(), '{"providers": {"me')
+    await expect(muse.liveFingerprint!()).rejects.toThrow()
+    rmSync(museAuthPath())
+    mkdirSync(museAuthPath())
+    await expect(muse.liveFingerprint!()).rejects.toThrow(/EISDIR/)
   })
 
   it('captures the live file whole, activates it back 0600 by rename, and null logs out', async () => {

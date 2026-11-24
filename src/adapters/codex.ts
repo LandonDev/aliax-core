@@ -251,13 +251,19 @@ export const codex: Adapter = {
    * rotates with every renewal, so matching the live file's against a stored
    * blob's says whether the blob IS the grant the CLI here keeps refreshing.
    * Handing that one to another host would put two refreshers on it.
+   * Null only when auth.json is not there or holds no refresh token; a file
+   * that cannot be read or parsed throws (see Adapter.liveFingerprint).
    */
   async liveFingerprint() {
+    let text: string
     try {
-      return lineageOf(readFileSync(authPath(), 'utf8'))
-    } catch {
-      return null
+      text = readFileSync(authPath(), 'utf8')
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw e
     }
+    JSON.parse(text)
+    return lineageOf(text)
   },
 
   fingerprintOf(blob: string) {

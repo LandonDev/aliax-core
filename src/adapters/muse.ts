@@ -117,9 +117,17 @@ export const muse: Adapter = {
     return cred ? museAccountId(cred) : null
   },
 
+  /** Null only for no auth.json or one with no login in it; an unreadable or unparsable file throws (Adapter.liveFingerprint). */
   async liveFingerprint() {
-    const text = readLive()
-    return text ? museFingerprint(text) : null
+    let text: string
+    try {
+      text = readFileSync(museAuthPath(), 'utf8')
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw e
+    }
+    JSON.parse(text)
+    return museFingerprint(text)
   },
 
   fingerprintOf: museFingerprint,

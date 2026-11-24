@@ -90,6 +90,14 @@ export interface Adapter {
   /**
    * Token-level identity of the live credentials, for tools whose account metadata file
    * can be clobbered by running sessions. Match against fingerprintOf(blob).
+   *
+   * Null means the CLI is confirmed signed out here: its store says nothing is
+   * stored (a missing file, no Keychain item) or what is stored holds no grant.
+   * Anything unreadable (EACCES, EIO, a Keychain error other than not found,
+   * text that does not parse) throws: the caller does not know, and must not
+   * read that as no login. A handoff in particular must be withheld on a throw,
+   * or it may give away the grant the CLI is signed in with. A caller that only
+   * matches a fingerprint, where unknown and none act the same, catches.
    */
   liveFingerprint?(): Promise<string | null>
   fingerprintOf?(blob: string): string | null
