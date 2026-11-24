@@ -14,7 +14,6 @@ import {
   rmdirSync,
   rmSync,
   statSync,
-  writeFileSync,
   writeSync
 } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -272,10 +271,10 @@ function readOrNull(path: string): string | null {
 }
 
 /** Write a file that must not exist yet, flushed to disk before it is closed. */
-function writeExclusiveFlushed(path: string, data: string): void {
+function writeExclusiveFlushed(path: string, data: string | Buffer): void {
   const fd = openSync(path, 'wx', 0o600)
   try {
-    writeSync(fd, data)
+    writeSync(fd, typeof data === 'string' ? Buffer.from(data) : data)
     fsyncSync(fd)
   } finally {
     closeSync(fd)
@@ -368,8 +367,20 @@ function openWrapped(text: string, wrap: KeyWrap | undefined, path: string): str
  * vault.key.next on disk means the new set is whole and the move goes on;
  * without one the new set may be partial and is thrown away.
  */
-function recoverMigration(keyPath: string): void {
+function recoverMigration(keyPath: string, wrap: KeyWrap | undefined): void {
   const p = setPaths(keyPath)
+  rmSync(`${p.keyNext}.tmp`, { force: true })
+  // vault.key.next is renamed into place whole, but it is still proven to open before the new set is
+  // taken: a key that does not open undoes the migration and keeps the old set and key (final review F04).
+  if (existsSync(p.keyNext) && !keyOpens(p.keyNext, wrap)) {
+    rmSync(p.keyNext, { force: true })
+    if (existsSync(p.old)) {
+      rmSync(p.secrets, { recursive: true, force: true })
+      renameSync(p.old, p.secrets)
+    }
+    rmSync(p.next, { recursive: true, force: true })
+    return
+  }
   if (existsSync(p.keyNext)) {
     if (existsSync(p.next)) {
       if (!existsSync(p.old)) {
@@ -391,6 +402,17 @@ function recoverMigration(keyPath: string): void {
     }
   }
   rmSync(p.old, { recursive: true, force: true })
+}
+
+function keyOpens(path: string, wrap: KeyWrap | undefined): boolean {
+  const text = (readOrNull(path) ?? '').trim()
+  if (!text.startsWith(WRAP_PREFIX)) return false
+  try {
+    openWrapped(text, wrap, path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -443,7 +465,7 @@ function migrateLegacyOnce(keyPath: string, oldPassword: string, wrap: KeyWrap):
       console.warn(`[aliax] vault: ${f} did not open under the old key; carried across unchanged`)
       continue
     }
-    writeFileSync(to, chromiumEncrypt(key, plain), { mode: 0o600 })
+    writeExclusiveFlushed(to, chromiumEncrypt(key, plain))
     migrationStep.current?.('sealed', f)
   }
   for (const f of files) {
@@ -454,7 +476,17 @@ function migrateLegacyOnce(keyPath: string, oldPassword: string, wrap: KeyWrap):
     }
   }
   migrationStep.current?.('checked')
-  writeExclusiveFlushed(p.keyNext, keyText(password, wrap))
+  // The sealed key must open again before it is written, and it appears at vault.key.next only whole.
+  let text: string
+  try {
+    text = keyText(password, wrap)
+    if (openWrapped(text.trim(), wrap, keyPath) !== password) throw new VaultLocked('unwrap', 'the sealed key did not open again')
+  } catch (e) {
+    rmSync(p.next, { recursive: true, force: true })
+    throw e
+  }
+  writeExclusiveFlushed(`${p.keyNext}.tmp`, text)
+  renameSync(`${p.keyNext}.tmp`, p.keyNext)
   migrationStep.current?.('keyWritten')
   if (existsSync(p.secrets)) renameSync(p.secrets, p.old)
   migrationStep.current?.('oldMoved')
@@ -499,7 +531,7 @@ function fileKeyPassword(path: string, wrap: KeyWrap | undefined): string {
   }
   mkdirSync(p.dir, { recursive: true, mode: 0o700 })
   return withKeyLock(p.lock, () => {
-    recoverMigration(path)
+    recoverMigration(path, wrap)
     const text = read()
     const ready = settle(text)
     if (ready !== null) return ready

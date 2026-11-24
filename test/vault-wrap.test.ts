@@ -203,3 +203,33 @@ describe('fileKey with a wrap', () => {
     expect(vault.readSecret('codex', 'two')).toBe('{"fake":"two"}')
   }, 30_000)
 })
+
+describe('the migration key is whole and proven before the new set is taken (final review F04)', () => {
+  it('a vault.key.next that does not open undoes the migration and keeps the old set', () => {
+    const { dataDir, keyPath } = legacyVault()
+    useWrap(dataDir)
+    vault.migrationStep.current = (s) => {
+      if (s === 'keyWritten') throw new Error('crash')
+    }
+    expect(() => vault.readSecret('claude-code', 'one')).toThrow('crash')
+    vault.migrationStep.current = null
+    // the key a power loss left half written
+    writeFileSync(`${keyPath}.next`, 'aliax-wrap:v1:')
+    vault.resetKeyCache()
+    expect(vault.readSecret('claude-code', 'one')).toBe('fake-token-one')
+    expect(vault.readSecret('codex', 'two')).toBe('{"fake":"two"}')
+    expect(readFileSync(keyPath, 'utf8').startsWith('aliax-wrap:v1:')).toBe(true)
+  })
+
+  it('a wrap whose seal does not open again leaves the plain key and the old set as they were', () => {
+    const { dataDir, keyPath, password } = legacyVault()
+    configure({ dataDir, fetch: noFetch, secrets: { mode: 'fileKey', wrap: { seal: () => Buffer.from('junk'), open: () => Buffer.from('nope') } } })
+    vault.resetKeyCache()
+    expect(() => vault.readSecret('claude-code', 'one')).toThrow()
+    expect(readFileSync(keyPath, 'utf8').trim()).toBe(password)
+    for (const sib of ['secrets.next', 'secrets.old', 'vault.key.next']) expect(existsSync(join(dataDir, sib))).toBe(false)
+    configure({ dataDir, fetch: noFetch, secrets: { mode: 'fileKey' } })
+    vault.resetKeyCache()
+    expect(vault.readSecret('claude-code', 'one')).toBe('fake-token-one')
+  })
+})
