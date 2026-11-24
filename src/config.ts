@@ -21,8 +21,17 @@ export type SecretsMode =
    * No Keychain at all (a Linux agent box): a random password in a file with
    * mode 0600, default `<dataDir>/vault.key`, stands in for the Keychain item
    * and feeds the same derivation, so the blobs stay the same "v10" bytes.
+   * With `wrap` (Windows: Electron's safeStorage, DPAPI for the current user)
+   * the file holds the password sealed, `aliax-wrap:v1:<base64>`, and a plain
+   * key found there is migrated once (vault.ts).
    */
-  | { mode: 'fileKey'; path?: string }
+  | { mode: 'fileKey'; path?: string; wrap?: KeyWrap }
+
+/** Seals and opens the key file's password for one OS user. Both throw when the OS refuses. */
+export interface KeyWrap {
+  seal: (bytes: Buffer) => Buffer
+  open: (bytes: Buffer) => Buffer
+}
 
 export interface UsageSample {
   service: ServiceId
