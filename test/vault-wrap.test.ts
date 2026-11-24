@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { configure, type KeyWrap } from '../src/config'
@@ -109,6 +109,20 @@ describe('fileKey with a wrap', () => {
       }
     })
   }
+
+  it('carries a blob the old key never opened, and a folder in the set, across the migration; the rest opens', () => {
+    const { dataDir, keyPath } = legacyVault()
+    const secrets = join(dataDir, 'secrets')
+    writeFileSync(join(secrets, 'claude-code__lost.bin'), Buffer.concat([Buffer.from('v10'), Buffer.alloc(32, 7)]))
+    mkdirSync(join(secrets, 'nested'))
+    writeFileSync(join(secrets, 'nested', 'kept.txt'), 'kept')
+    useWrap(dataDir)
+    expect(vault.vaultLocked()).toBe(false)
+    expect(vault.readSecret('claude-code', 'one')).toBe('fake-token-one')
+    expect(readFileSync(keyPath, 'utf8').startsWith('aliax-wrap:v1:')).toBe(true)
+    expect(readFileSync(join(secrets, 'claude-code__lost.bin')).subarray(3)).toEqual(Buffer.alloc(32, 7))
+    expect(readFileSync(join(secrets, 'nested', 'kept.txt'), 'utf8')).toBe('kept')
+  })
 
   it('locks, and makes nothing, when the key is missing beside sealed secrets', () => {
     const { dataDir, keyPath } = legacyVault()

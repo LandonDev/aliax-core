@@ -3,6 +3,7 @@ import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from 'node:
 import {
   closeSync,
   copyFileSync,
+  cpSync,
   existsSync,
   fsyncSync,
   mkdirSync,
@@ -400,6 +401,16 @@ function recoverMigration(keyPath: string): void {
  * leaves the old set or the new one whole (recoverMigration).
  */
 function migrateLegacy(keyPath: string, oldPassword: string, wrap: KeyWrap): string {
+  try {
+    return migrateLegacyOnce(keyPath, oldPassword, wrap)
+  } catch (e) {
+    // Any other failure locks the vault (Start fresh offers itself) rather than throwing on every read.
+    if (isVaultLocked(e)) throw e
+    throw new VaultLocked('malformed', `the vault could not be moved to its sealed key: ${(e as Error).message}`)
+  }
+}
+
+function migrateLegacyOnce(keyPath: string, oldPassword: string, wrap: KeyWrap): string {
   const p = setPaths(keyPath)
   const oldKey = deriveChromiumKey(oldPassword)
   const password = randomBytes(32).toString('hex')
@@ -407,21 +418,36 @@ function migrateLegacy(keyPath: string, oldPassword: string, wrap: KeyWrap): str
   rmSync(p.next, { recursive: true, force: true })
   mkdirSync(p.next, { recursive: true, mode: 0o700 })
   const files = existsSync(p.secrets) ? readdirSync(p.secrets) : []
+  /** Blobs the old key never opened (sealed under a key an older build lost): unreadable before, carried as they are. */
+  const unreadable = new Set<string>()
   for (const f of files) {
     const from = join(p.secrets, f)
-    if (!statSync(from).isFile()) continue
     const to = join(p.next, f)
+    if (statSync(from).isDirectory()) {
+      // a folder in the set moves with it whole
+      cpSync(from, to, { recursive: true })
+      continue
+    }
+    if (!statSync(from).isFile()) continue
     if (!f.endsWith('.bin')) {
       // a side file (an app-session archive) is not sealed by this key: it moves with the set as it is
       copyFileSync(from, to)
       continue
     }
-    const plain = chromiumDecrypt(oldKey, readFileSync(from))
+    let plain: string
+    try {
+      plain = chromiumDecrypt(oldKey, readFileSync(from))
+    } catch {
+      unreadable.add(f)
+      copyFileSync(from, to)
+      console.warn(`[aliax] vault: ${f} did not open under the old key; carried across unchanged`)
+      continue
+    }
     writeFileSync(to, chromiumEncrypt(key, plain), { mode: 0o600 })
     migrationStep.current?.('sealed', f)
   }
   for (const f of files) {
-    if (!f.endsWith('.bin') || !existsSync(join(p.next, f))) continue
+    if (!f.endsWith('.bin') || unreadable.has(f) || !existsSync(join(p.next, f))) continue
     const plain = chromiumDecrypt(oldKey, readFileSync(join(p.secrets, f)))
     if (chromiumDecrypt(key, readFileSync(join(p.next, f))) !== plain) {
       throw new VaultLocked('malformed', `re-sealed ${f} did not read back`)
