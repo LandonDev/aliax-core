@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { configure, type KeyWrap } from '../src/config'
 import * as vault from '../src/vault'
 import { noFetch, tempCore } from './helpers'
@@ -19,6 +19,8 @@ const fakeWrap = (user: string): KeyWrap => ({
 let cleanup = (): void => {}
 afterEach(() => {
   vault.migrationStep.current = null
+  vault.keyLockTest.step = null
+  vault.keyLockTest.waitMs = 30_000
   vault.resetKeyCache()
   cleanup()
 })
@@ -231,5 +233,91 @@ describe('the migration key is whole and proven before the new set is taken (fin
     configure({ dataDir, fetch: noFetch, secrets: { mode: 'fileKey' } })
     vault.resetKeyCache()
     expect(vault.readSecret('claude-code', 'one')).toBe('fake-token-one')
+  })
+})
+
+describe('every secret read and write shares the vault lock and the committed key (security review F14)', () => {
+  it('a process that opened the plain key before another migrated the vault cannot write an old-key blob into the new set', async () => {
+    const { dataDir, keyPath } = legacyVault()
+    // this module instance: plain mode, the legacy key opened and cached
+    expect(vault.readSecret('codex', 'two')).toBe('{"fake":"two"}')
+    // another process (a second instance of the modules) with the wrap migrates the vault
+    vi.resetModules()
+    const config2 = await import('../src/config')
+    const vault2 = await import('../src/vault')
+    config2.configure({ dataDir, fetch: noFetch, secrets: { mode: 'fileKey', wrap: fakeWrap('tcuser') } })
+    expect(vault2.readSecret('claude-code', 'one')).toBe('fake-token-one')
+    expect(readFileSync(keyPath, 'utf8').startsWith('aliax-wrap:v1:')).toBe(true)
+    // the first process, still holding the old key, writes: refused, since it cannot open the committed key
+    expect(() => vault.saveSecret('claude-code', 'one', 'stale-token')).toThrow()
+    useWrap(dataDir)
+    expect(vault.readSecret('claude-code', 'one')).toBe('fake-token-one')
+    expect(vault.readSecret('codex', 'two')).toBe('{"fake":"two"}')
+  })
+
+  it('a process holding a key that is no longer committed opens the new one and seals under it', async () => {
+    const { dataDir, cleanup: c } = tempCore()
+    cleanup = c
+    useWrap(dataDir)
+    vault.saveSecret('codex', 'a', 'first')
+    // another process replaces the committed key (the files on disk change under this one's cache)
+    vi.resetModules()
+    const config2 = await import('../src/config')
+    const vault2 = await import('../src/vault')
+    config2.configure({ dataDir, fetch: noFetch, secrets: { mode: 'fileKey', wrap: fakeWrap('tcuser') } })
+    rmSync(join(dataDir, 'secrets'), { recursive: true })
+    rmSync(join(dataDir, 'vault.key'))
+    vault2.saveSecret('codex', 'b', 'second')
+    vault.saveSecret('codex', 'a', 'third')
+    vault2.resetKeyCache()
+    expect(vault2.readSecret('codex', 'a')).toBe('third')
+    expect(vault2.readSecret('codex', 'b')).toBe('second')
+  })
+
+  it('two waiters on one stale lock: neither removes the fresh lock the other made', () => {
+    const { dataDir, cleanup: c } = tempCore()
+    cleanup = c
+    useWrap(dataDir)
+    const lock = join(dataDir, 'vault.key.lock')
+    writeFileSync(lock, JSON.stringify({ pid: 999_999_999, at: Date.now() }))
+    // the other waiter judged the same lock stale, removed it and made its own just before this one looks again
+    const other = JSON.stringify({ pid: process.ppid, at: Date.now(), id: 'other' })
+    let seen: string | null = null
+    vault.keyLockTest.step = (step) => {
+      if (step === 'stale' && seen === null) {
+        rmSync(lock)
+        writeFileSync(lock, other)
+        seen = 'made'
+      } else if (step === 'waiting' && seen === 'made') {
+        // the other waiter's lock is still whole while it works; then it lets go
+        seen = readFileSync(lock, 'utf8')
+        rmSync(lock)
+      }
+    }
+    vault.saveSecret('codex', 'a', 'fake')
+    expect(seen).toBe(other)
+    expect(vault.readSecret('codex', 'a')).toBe('fake')
+    expect(existsSync(lock)).toBe(false)
+  })
+
+  it('a live holder is not taken over for its age: a lock a minute old waits, then reads busy', () => {
+    const { dataDir, cleanup: c } = tempCore()
+    cleanup = c
+    useWrap(dataDir)
+    vault.saveSecret('codex', 'a', 'fake')
+    const lock = join(dataDir, 'vault.key.lock')
+    const held = JSON.stringify({ pid: process.ppid, at: Date.now() - 120_000 })
+    writeFileSync(lock, held)
+    vault.keyLockTest.waitMs = 200
+    let err: unknown
+    try {
+      vault.readSecret('codex', 'a')
+    } catch (e) {
+      err = e
+    }
+    expect(lockOf(err)).toBe('busy')
+    expect(readFileSync(lock, 'utf8')).toBe(held)
+    rmSync(lock)
+    expect(vault.readSecret('codex', 'a')).toBe('fake')
   })
 })

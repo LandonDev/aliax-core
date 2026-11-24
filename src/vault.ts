@@ -16,6 +16,7 @@ import {
   statSync,
   writeSync
 } from 'node:fs'
+import { uptime } from 'node:os'
 import { dirname, join } from 'node:path'
 import { config, dataDir, hooks, type KeyWrap, type SaveOrigin, type SecretsMode } from './config'
 import { writeAtomic } from './fs'
@@ -107,9 +108,12 @@ export function deleteProfile(serviceId: ServiceId, name: string): void {
   const meta = loadMeta()
   meta[serviceId] = (meta[serviceId] ?? []).filter((p) => p.name !== name)
   saveMeta(meta)
-  for (const suffix of ['bin', 'claude-desktop.tar.gz']) {
-    rmSync(`${fileStem(serviceId, name)}.${suffix}`, { force: true })
-  }
+  // under the vault lock, so a migration copying the set cannot carry a deleted secret across
+  underVault(() => {
+    for (const suffix of ['bin', 'claude-desktop.tar.gz']) {
+      rmSync(`${fileStem(serviceId, name)}.${suffix}`, { force: true })
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +218,7 @@ export function useFixedChromiumKey(item: string, key: Buffer): void {
 // the host passes a wrap (safeStorage, so DPAPI for the current user) and the
 // file holds the password sealed for that user alone; 0600 means nothing there.
 
-let fileKeyCache: { path: string; key: Buffer } | null = null
+let fileKeyCache: { path: string; wrap: KeyWrap | undefined; text: string; key: Buffer } | null = null
 
 export const defaultVaultKeyPath = (): string => join(dataDir(), 'vault.key')
 
@@ -270,16 +274,19 @@ function readOrNull(path: string): string | null {
   }
 }
 
-/** Write a file that must not exist yet, flushed to disk before it is closed. */
-function writeExclusiveFlushed(path: string, data: string | Buffer): void {
+/** Write a file that must not exist yet, flushed to disk before it is closed unless `flush` is false. */
+function writeExclusiveFlushed(path: string, data: string | Buffer, flush = true): void {
   const fd = openSync(path, 'wx', 0o600)
   try {
     writeSync(fd, typeof data === 'string' ? Buffer.from(data) : data)
-    fsyncSync(fd)
+    if (flush) fsyncSync(fd)
   } finally {
     closeSync(fd)
   }
 }
+
+/** A lock file: exclusive, but not flushed, since a lock outlives no boot (see lockStale). */
+const writeExclusive = (path: string, data: string): void => writeExclusiveFlushed(path, data, false)
 
 const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
@@ -294,44 +301,105 @@ const pidAlive = (pid: number): boolean => {
   }
 }
 
-/** A lock older than this, or held by a process that is gone, is taken over. */
-const LOCK_STALE_MS = 60_000
-const LOCK_WAIT_MS = 30_000
+/** A lock file that never got its content (its maker died between open and write) is stale after this. */
+const LOCK_UNWRITTEN_MS = 60_000
+
+/** Test seam: how long a waiter waits for a live holder, and a hook at each step of the wait. */
+export const keyLockTest: { waitMs: number; step: ((step: 'stale' | 'waiting', lockPath: string) => void) | null } = {
+  waitMs: 30_000,
+  step: null
+}
+
+/** Locks this process holds now, by path: the lock is re-entrant within a process. */
+const heldLocks = new Map<string, number>()
 
 /**
- * One holder at a time across processes for making or migrating the key:
- * an exclusive lock file with the holder's pid. Sync on purpose, like every
- * vault read: the wait is short, and a holder that died is taken over.
+ * Whether a lock's text names a holder that is gone. Only a dead pid, or a
+ * lock made before this boot (its pid may now be someone else's), is stale:
+ * a live holder is never taken over for its age, however long its work.
+ * Text that does not parse is a lock still being written, stale only once
+ * it has lingered.
+ */
+function lockStale(text: string, lockPath: string): boolean {
+  let held: { pid?: unknown; at?: unknown }
+  try {
+    held = JSON.parse(text)
+  } catch {
+    return Date.now() - statMtime(lockPath) > LOCK_UNWRITTEN_MS
+  }
+  if (typeof held.pid !== 'number' || !pidAlive(held.pid)) return true
+  const bootedAt = Date.now() - uptime() * 1000
+  return typeof held.at === 'number' && held.at < bootedAt - 10_000
+}
+
+/**
+ * Remove a lock judged stale only if it is still that lock. The check and
+ * the removal run under a second lock, `<lock>.break`, so two waiters that
+ * judged the same lock stale never remove each other's fresh one (a plain
+ * remove did: the second waiter's rm took the first waiter's new lock). A
+ * breaker is held for one read and one unlink; one whose holder died is
+ * cleared the same way, by its dead pid alone. False while another waiter
+ * holds the breaker.
+ */
+function breakStale(lockPath: string, judged: string): boolean {
+  const breaker = `${lockPath}.break`
+  try {
+    writeExclusive(breaker, JSON.stringify({ pid: process.pid, at: Date.now(), id: randomBytes(8).toString('hex') }))
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+    const other = readOrNull(breaker)
+    if (other !== null && lockStale(other, breaker) && readOrNull(breaker) === other) rmSync(breaker, { force: true })
+    return false
+  }
+  try {
+    keyLockTest.step?.('stale', lockPath)
+    if (readOrNull(lockPath) === judged) rmSync(lockPath, { force: true })
+  } finally {
+    rmSync(breaker, { force: true })
+  }
+  return true
+}
+
+/**
+ * One holder at a time across processes for opening, making or migrating
+ * the key and for every secret read or write in fileKey mode: an exclusive
+ * lock file with the holder's pid. Sync on purpose, like every vault read:
+ * the wait is short, and a holder that died is taken over.
  */
 function withKeyLock<T>(lockPath: string, work: () => T): T {
+  const depth = heldLocks.get(lockPath) ?? 0
+  if (depth > 0) {
+    heldLocks.set(lockPath, depth + 1)
+    try {
+      return work()
+    } finally {
+      heldLocks.set(lockPath, depth)
+    }
+  }
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 })
-  const until = Date.now() + LOCK_WAIT_MS
+  const mine = JSON.stringify({ pid: process.pid, at: Date.now(), id: randomBytes(8).toString('hex') })
+  const until = Date.now() + keyLockTest.waitMs
   for (;;) {
     try {
-      writeExclusiveFlushed(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() }))
+      writeExclusive(lockPath, mine)
       break
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
     }
-    let stale = false
-    try {
-      const held = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number; at?: number }
-      stale = !held.pid || !pidAlive(held.pid) || Date.now() - (held.at ?? 0) > LOCK_STALE_MS
-    } catch {
-      // half-written or gone: look again on the next turn unless it lingers
-      stale = Date.now() - statMtime(lockPath) > LOCK_STALE_MS
-    }
-    if (stale) {
-      rmSync(lockPath, { force: true })
-      continue
-    }
+    const held = readOrNull(lockPath)
+    if (held === null) continue
+    if (lockStale(held, lockPath) && breakStale(lockPath, held)) continue
     if (Date.now() > until) throw new VaultLocked('busy', `another process holds ${lockPath}`)
+    keyLockTest.step?.('waiting', lockPath)
     sleepSync(50)
   }
+  heldLocks.set(lockPath, 1)
   try {
     return work()
   } finally {
-    rmSync(lockPath, { force: true })
+    heldLocks.delete(lockPath)
+    // remove only our own lock: never one another waiter made after ours went
+    if (readOrNull(lockPath) === mine) rmSync(lockPath, { force: true })
   }
 }
 
@@ -509,7 +577,8 @@ export const migrationStep: { current: ((step: string, file?: string) => void) |
  * - exactly `aliax-wrap:v1:…`: opened through the wrap;
  * - anything else, or no key beside sealed secrets: VaultLocked, nothing
  *   made or rewritten.
- * Making and migrating hold one lock file across processes.
+ * The caller holds the vault lock (fileKey), so making, migrating and every
+ * secret read or write take turns across processes.
  */
 function fileKeyPassword(path: string, wrap: KeyWrap | undefined): string {
   const read = (): string | null => {
@@ -524,36 +593,47 @@ function fileKeyPassword(path: string, wrap: KeyWrap | undefined): string {
     throw new VaultLocked('malformed', `vault key file ${path} is not a key`)
   }
   const p = setPaths(path)
-  const unsettled = (): boolean => existsSync(p.keyNext) || existsSync(p.next) || existsSync(p.old)
-  if (!unsettled()) {
-    const quick = settle(read())
-    if (quick !== null) return quick
+  if (unsettled(p)) recoverMigration(path, wrap)
+  const text = read()
+  const ready = settle(text)
+  if (ready !== null) return ready
+  if (text !== null && wrap) return migrateLegacy(path, text, wrap)
+  if (hasSealed(p.secrets)) {
+    throw new VaultLocked('missing', `vault key file ${path} is missing beside sealed secrets`)
   }
-  mkdirSync(p.dir, { recursive: true, mode: 0o700 })
-  return withKeyLock(p.lock, () => {
-    recoverMigration(path, wrap)
-    const text = read()
-    const ready = settle(text)
-    if (ready !== null) return ready
-    if (text !== null && wrap) return migrateLegacy(path, text, wrap)
-    if (hasSealed(p.secrets)) {
-      throw new VaultLocked('missing', `vault key file ${path} is missing beside sealed secrets`)
-    }
-    const password = randomBytes(32).toString('hex')
-    const tmp = `${path}.${process.pid}.new`
-    rmSync(tmp, { force: true })
-    writeExclusiveFlushed(tmp, keyText(password, wrap))
-    renameSync(tmp, path)
-    return password
-  })
+  const password = randomBytes(32).toString('hex')
+  const tmp = `${path}.${process.pid}.new`
+  rmSync(tmp, { force: true })
+  writeExclusiveFlushed(tmp, keyText(password, wrap))
+  renameSync(tmp, path)
+  return password
 }
 
+/** A migration a crash cut short left its siblings on disk. */
+const unsettled = (p: ReturnType<typeof setPaths>): boolean =>
+  existsSync(p.keyNext) || existsSync(p.next) || existsSync(p.old)
+
+/**
+ * The key the committed vault.key holds now, opened under the vault lock.
+ * The cache serves only while vault.key is still the text it was opened
+ * from (and no migration is half done): another process may have migrated
+ * the vault to a new key since, and a key kept by path alone then sealed
+ * blobs the next open could not read. A changed file is opened again, so a
+ * write seals under the current key, or is refused when this host cannot
+ * open it (a plain-mode process after a wrapped one migrated: VaultLocked).
+ */
 function fileKey(s: { path?: string; wrap?: KeyWrap }): Buffer {
   const path = s.path ?? defaultVaultKeyPath()
-  if (fileKeyCache?.path === path) return fileKeyCache.key
-  const key = deriveChromiumKey(fileKeyPassword(path, s.wrap))
-  fileKeyCache = { path, key }
-  return key
+  const p = setPaths(path)
+  return withKeyLock(p.lock, () => {
+    const c = fileKeyCache
+    if (c?.path === path && c.wrap === s.wrap && !unsettled(p) && readOrNull(path) === c.text) return c.key
+    fileKeyCache = null
+    const key = deriveChromiumKey(fileKeyPassword(path, s.wrap))
+    const text = readOrNull(path)
+    if (text !== null) fileKeyCache = { path, wrap: s.wrap, text, key }
+    return key
+  })
 }
 
 /** The AES key behind the v10 blobs; throws when the Keychain holds it back. */
@@ -565,13 +645,20 @@ function sealingKey(s: Exclude<SecretsMode, { mode: 'safeStorage' }>): Buffer {
 }
 
 /**
- * In fileKey mode the key is opened before any secret is read or written: an
- * open may finish a migration that moves the whole set, so a blob read
- * before it would be the old set's.
+ * Run a read or write of the sealed set. In fileKey mode it runs under the
+ * vault lock, with the key checked against the committed vault.key first:
+ * an open may finish a migration that moves the whole set, so a blob read
+ * before it would be the old set's, and a migration cannot run between the
+ * key check and the blob's read or write. Builds older than this lock no
+ * reads or writes and stay exposed.
  */
-function openKeyFirst(): void {
+function underVault<T>(work: () => T): T {
   const s = config().secrets
-  if (s.mode === 'fileKey') fileKey(s)
+  if (s.mode !== 'fileKey') return work()
+  return withKeyLock(setPaths(s.path ?? defaultVaultKeyPath()).lock, () => {
+    fileKey(s)
+    return work()
+  })
 }
 
 function encrypt(plain: string): Buffer {
@@ -588,8 +675,7 @@ function decrypt(blob: Buffer): string {
 
 /** Seal one profile's credentials. `origin` says whether this machine made the change (see SaveOrigin). */
 export function saveSecret(serviceId: ServiceId, name: string, blob: string, origin: SaveOrigin = 'local'): void {
-  openKeyFirst()
-  writeAtomic(`${fileStem(serviceId, name)}.bin`, encrypt(blob))
+  underVault(() => writeAtomic(`${fileStem(serviceId, name)}.bin`, encrypt(blob)))
   hooks().onSecretSaved?.(serviceId, name, origin)
 }
 
@@ -618,7 +704,10 @@ function decryptWithPastKey(buf: Buffer): string | null {
 }
 
 export function readSecret(serviceId: ServiceId, name: string): string | null {
-  openKeyFirst()
+  return underVault(() => readSecretLocked(serviceId, name))
+}
+
+function readSecretLocked(serviceId: ServiceId, name: string): string | null {
   const path = `${fileStem(serviceId, name)}.bin`
   if (!existsSync(path)) return null
   const raw = readFileSync(path)
@@ -641,6 +730,10 @@ export function extraPath(serviceId: ServiceId, name: string, suffix: string): s
 
 /** Move side files captured under a placeholder profile name to the real one. */
 export function adoptExtras(serviceId: ServiceId, from: string, to: string): void {
+  underVault(() => adoptExtrasLocked(serviceId, from, to))
+}
+
+function adoptExtrasLocked(serviceId: ServiceId, from: string, to: string): void {
   const dir = secretsDir()
   const fromPrefix = `${serviceId}__${encodeURIComponent(from)}.`
   const toPrefix = `${serviceId}__${encodeURIComponent(to)}.`
