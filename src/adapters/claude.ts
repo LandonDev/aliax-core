@@ -398,9 +398,6 @@ const WINDOW_LABELS: Record<string, string> = {
   seven_day_cowork: 'Cowork'
 }
 
-/** Always-present windows. Everything else is a per-model cap. */
-const BASE_WINDOWS = new Set(['five_hour', 'seven_day'])
-
 interface ApiLimit {
   kind?: string
   group?: string
@@ -445,9 +442,10 @@ export function parseClaudeUsage(body: Record<string, unknown> & { limits?: ApiL
     if (typeof l.percent !== 'number') continue
     const weekly = l.group === 'weekly'
     const model = l.scope?.model?.display_name ?? null
-    // A per-model cap only earns a bar once it has been used; at zero it would
-    // be a full bar saying nothing.
-    if (l.kind === 'weekly_scoped' && (!model || l.percent <= 0)) continue
+    // A per-model cap at zero stays: it is the provider saying the cap is
+    // empty, which a host needs to retire an older full sample. Whether it
+    // earns a bar is the views' rule, not the data's.
+    if (l.kind === 'weekly_scoped' && !model) continue
     windows.push({
       label: l.kind === 'session' ? '5h' : l.kind === 'weekly_all' ? 'Weekly' : (model as string),
       usedPercent: l.percent,
@@ -462,7 +460,6 @@ export function parseClaudeUsage(body: Record<string, unknown> & { limits?: ApiL
     if (!value || typeof value !== 'object' || !('utilization' in value)) continue
     const { utilization, resets_at } = value as { utilization: unknown; resets_at?: unknown }
     if (typeof utilization !== 'number') continue
-    if (!BASE_WINDOWS.has(key) && utilization <= 0) continue
     windows.push({
       label: WINDOW_LABELS[key] ?? key.replace(/_/g, ' '),
       usedPercent: utilization,

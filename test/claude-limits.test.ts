@@ -15,7 +15,9 @@ describe('parseClaudeUsage', () => {
     expect(windows.map((w) => [w.label, w.usedPercent])).toEqual([
       ['5h', 12],
       ['Weekly', 40],
-      ['Fable', 63]
+      ['Fable', 63],
+      // A cap at zero is data: the provider saying it is empty (a reset), which retires an older full sample.
+      ['Opus', 0]
     ])
     expect(windows[0].periodMs).toBe(5 * 3_600_000)
     expect(windows[1].resetsAt).toBe(Date.parse('2026-09-20T00:00:00Z'))
@@ -26,9 +28,23 @@ describe('parseClaudeUsage', () => {
       seven_day: { utilization: 0 },
       seven_day_fable: { utilization: 0 }
     })
-    expect(windows.map((w) => w.label)).toEqual(['5h', 'week'])
+    expect(windows.map((w) => [w.label, w.usedPercent])).toEqual([
+      ['5h', 5],
+      ['week', 0],
+      ['Fable', 0]
+    ])
     expect(windows[0].resetsAt).toBe(1_800_000_000_000)
   })
+})
+
+it('drops a scoped cap that names no model', () => {
+  const windows = parseClaudeUsage({
+    limits: [
+      { kind: 'weekly_all', group: 'weekly', percent: 0 },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 0, scope: { model: null } }
+    ]
+  })
+  expect(windows.map((w) => w.label)).toEqual(['Weekly'])
 })
 
 describe('retryAfterMs', () => {

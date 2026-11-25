@@ -136,6 +136,38 @@ describe('accounts.usage cache gates', () => {
   })
 })
 
+describe('the whole-answer hook', () => {
+  it('fires once per fresh poll with every window, and never for a hiccup, a rate limit or a cache hit', async () => {
+    const onUsageAnswer = vi.fn()
+    ;({ cleanup } = tempCore({ hooks: { onUsageAnswer } }))
+    vault.upsertProfile('codex', { name: 'p', accountId: '1', createdAt: 1 })
+    vault.saveSecret('codex', 'p', '{}')
+    const usage = vi
+      .fn<Adapter['usage']>()
+      .mockResolvedValueOnce({ windows: [{ label: 'week', usedPercent: 3 }, { label: 'spark', usedPercent: 0 }] })
+      .mockResolvedValueOnce({ windows: [], note: 'session expired mid-poll' })
+      .mockResolvedValueOnce({ windows: [], note: 'usage temporarily unavailable', retryAfterMs: 60_000 })
+    stubCodex(usage)
+    await accounts.usage('codex', true)
+    expect(onUsageAnswer).toHaveBeenCalledTimes(1)
+    expect(onUsageAnswer).toHaveBeenCalledWith({ service: 'codex', account: 'p', windows: [{ label: 'week', usedPercent: 3 }, { label: 'spark', usedPercent: 0 }] })
+    // The cache answers; then a hiccup keeps the old numbers; then a rate limit keeps them too.
+    await accounts.usage('codex')
+    await accounts.usage('codex', true)
+    await accounts.usage('codex', true)
+    expect(onUsageAnswer).toHaveBeenCalledTimes(1)
+  })
+
+  it('is not fired by windows read off one response or by a 429', () => {
+    const onUsageAnswer = vi.fn()
+    ;({ cleanup } = tempCore({ hooks: { onUsageAnswer } }))
+    vault.upsertProfile('claude-code', { name: 'p', accountId: 'p', createdAt: 1 })
+    accounts.observeWindows('claude-code', 'p', [{ label: 'Fable', usedPercent: 0 }])
+    accounts.observeLimit('claude-code', 'p', { window: { model: 'Fable' } })
+    expect(onUsageAnswer).not.toHaveBeenCalled()
+  })
+})
+
 describe('a one-year token the usage endpoint refuses', () => {
   it('replaces the numbers cached from the credential before it with its note, instead of keeping them behind it', async () => {
     ;({ cleanup } = tempCore())

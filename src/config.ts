@@ -5,7 +5,7 @@
  * through), how to seal secrets, and what to do with events it observes.
  * Nothing in the core imports `electron`.
  */
-import type { ServiceId } from './shared/types'
+import type { ServiceId, UsageWindow } from './shared/types'
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>
 
@@ -50,8 +50,22 @@ export interface UsageSample {
  */
 export type SaveOrigin = 'local' | 'sync'
 
+/**
+ * One whole, fresh answer of the provider's usage endpoint for an account:
+ * every window it lists, after their samples. Never a cache hit, a failed or
+ * rate-limited poll, a kept-numbers fallback or a window read off a single
+ * response's headers. A label it does not list is one the provider no longer
+ * reports, which a host may take as evidence to retire an older sample of it.
+ */
+export interface UsageAnswer {
+  service: ServiceId
+  account: string
+  windows: UsageWindow[]
+}
+
 export interface Hooks {
   onUsageSample?: (sample: UsageSample) => void
+  onUsageAnswer?: (answer: UsageAnswer) => void
   onAppEvent?: (kind: string, service?: ServiceId, account?: string, detail?: string) => void
   /** The pinned account changed (a switch, later a failover); hosts redraw. Not fired for cache writes: a host that answers it with a poll would loop. */
   onAccountsChanged?: () => void

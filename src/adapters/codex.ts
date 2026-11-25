@@ -83,11 +83,9 @@ async function fetchApiUsage(auth: {
   pushApiWindows(windows, data.rate_limit)
   for (const add of data.additional_rate_limits ?? []) {
     const label = add.limit_name?.split(/[- ]/).pop()?.toLowerCase()
-    // A model-specific cap (Spark) only earns a bar once this cycle has
-    // actually touched it; an untouched cap at 100% left is just noise.
-    const extra: UsageWindow[] = []
-    pushApiWindows(extra, add.rate_limit, label)
-    windows.push(...extra.filter((w) => w.usedPercent > 0))
+    // A model-specific cap (Spark) at zero stays in the data, as Claude's do:
+    // whether an untouched cap earns a bar is the views' rule.
+    pushApiWindows(windows, add.rate_limit, label)
   }
   const banked = data.rate_limit_reset_credits?.available_count
   return { windows, banked: typeof banked === 'number' ? banked : undefined }

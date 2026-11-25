@@ -1,4 +1,4 @@
-export { configure, type CoreConfig, type Fetch, type Hooks, type KeyWrap, type Role, type SecretsMode, type UsageSample } from './config'
+export { configure, type CoreConfig, type Fetch, type Hooks, type KeyWrap, type Role, type SecretsMode, type UsageAnswer, type UsageSample } from './config'
 export * from './oauth'
 export * from './shared/types'
 export * from './shared/health'

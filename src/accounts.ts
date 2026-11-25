@@ -798,6 +798,9 @@ async function pollProfile(a: Adapter, p: { name: string }, active: string | nul
     for (const w of report.windows) {
       hooks().onUsageSample?.({ service: serviceId, account: p.name, label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt, periodMs: w.periodMs })
     }
+    // Whole only when the provider listed windows and said nothing else: an
+    // empty or annotated answer is no evidence that a window went away.
+    if (report.windows.length > 0 && !report.note) hooks().onUsageAnswer?.({ service: serviceId, account: p.name, windows: report.windows })
     cache().set(key, { at: now, report })
     persistCache()
     return report
